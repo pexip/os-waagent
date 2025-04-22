@@ -25,15 +25,16 @@ import azurelinuxagent.common.utils.fileutil as fileutil
 from azurelinuxagent.common.osutil.default import DefaultOSUtil
 from azurelinuxagent.common.utils.networkutil import NetworkInterfaceCard
 
-class OpenWRTOSUtil(DefaultOSUtil):
 
+class OpenWRTOSUtil(DefaultOSUtil):
     def __init__(self):
         super(OpenWRTOSUtil, self).__init__()
         self.agent_conf_file_path = '/etc/waagent.conf'
         self.dhclient_name = 'udhcpc'
-        self.ip_command_output = re.compile('^\d+:\s+(\w+):\s+(.*)$')
         self.jit_enabled = True
-        
+
+    _ip_command_output = re.compile(r'^\d+:\s+(\w+):\s+(.*)$')
+
     def eject_dvd(self, chk_err=True):
         logger.warn('eject is not supported on OpenWRT')
 
@@ -47,31 +48,30 @@ class OpenWRTOSUtil(DefaultOSUtil):
             return
 
         if expiration is not None:
-            cmd = "useradd -m {0} -s /bin/ash -e {1}".format(username, expiration)
+            cmd = ["useradd", "-m", username, "-s", "/bin/ash", "-e", expiration]
         else:
-            cmd = "useradd -m {0} -s /bin/ash".format(username)
+            cmd = ["useradd", "-m", username, "-s", "/bin/ash"]
         
         if not os.path.exists("/home"):
             os.mkdir("/home")
 
         if comment is not None:
-            cmd += " -c {0}".format(comment)
-        retcode, out = shellutil.run_get_output(cmd)
-        if retcode != 0:
-            raise OSUtilError(("Failed to create user account:{0}, "
-                               "retcode:{1}, "
-                               "output:{2}").format(username, retcode, out))
+            cmd.extend(["-c", comment])
+        self._run_command_raising_OSUtilError(cmd, err_msg="Failed to create user account:{0}".format(username))
 
     def get_dhcp_pid(self):
         return self._get_dhcp_pid(["pidof", self.dhclient_name])
 
-    def get_nic_state(self):
+    def get_nic_state(self, as_string=False):
         """
         Capture NIC state (IPv4 and IPv6 addresses plus link state).
 
         :return: Dictionary of NIC state objects, with the NIC name as key
         :rtype: dict(str,NetworkInformationCard)
         """
+        if as_string:  # as_string not supported on open wrt
+            return ''
+
         state = {}
         status, output = shellutil.run_get_output("ip -o link", chk_err=False, log_cmd=False)
 
@@ -80,18 +80,18 @@ class OpenWRTOSUtil(DefaultOSUtil):
             return {}
 
         for entry in output.splitlines():
-            result = self.ip_command_output.match(entry)
+            result = OpenWRTOSUtil._ip_command_output.match(entry)
             if result:
                 name = result.group(1)
                 state[name] = NetworkInterfaceCard(name, result.group(2))
-
 
         self._update_nic_state(state, "ip -o -f inet address", NetworkInterfaceCard.add_ipv4, "an IPv4 address")
         self._update_nic_state(state, "ip -o -f inet6 address", NetworkInterfaceCard.add_ipv6, "an IPv6 address")
 
         return state
 
-    def _update_nic_state(self, state, ip_command, handler, description):
+    @staticmethod
+    def _update_nic_state(state, ip_command, handler, description):
         """
         Update the state of NICs based on the output of a specified ip subcommand.
 
@@ -105,7 +105,7 @@ class OpenWRTOSUtil(DefaultOSUtil):
             return
 
         for entry in output.splitlines():
-            result = self.ip_command_output.match(entry)
+            result = OpenWRTOSUtil._ip_command_output.match(entry)
             if result:
                 interface_name = result.group(1)
                 if interface_name in state:
@@ -125,12 +125,12 @@ class OpenWRTOSUtil(DefaultOSUtil):
     def start_network(self) :
         return shellutil.run("/etc/init.d/network start", chk_err=True)
 
-    def restart_ssh_service(self):
+    def restart_ssh_service(self):  # pylint: disable=R1710
         # Since Dropbear is the default ssh server on OpenWRt, lets do a sanity check
         if os.path.exists("/etc/init.d/sshd"):
             return shellutil.run("/etc/init.d/sshd restart", chk_err=True)
         else:
-            logger.warn("sshd service does not exists", username)
+            logger.warn("sshd service does not exists")
 
     def stop_agent_service(self):
         return shellutil.run("/etc/init.d/{0} stop".format(self.service_name), chk_err=True)
@@ -146,7 +146,9 @@ class OpenWRTOSUtil(DefaultOSUtil):
 
     def set_hostname(self, hostname):
         fileutil.write_file('/etc/hostname', hostname)
-        shellutil.run("uci set system.@system[0].hostname='{0}' && uci commit system && /etc/init.d/system reload".format(hostname), chk_err=False)
+        commands = [['uci', 'set', 'system.@system[0].hostname={0}'.format(hostname)], ['uci', 'commit', 'system'],
+                    ['/etc/init.d/system', 'reload']]
+        self._run_multiple_commands_without_raising(commands, log_error=False, continue_on_error=False)
 
     def remove_rules_files(self, rules_files=""):
         pass

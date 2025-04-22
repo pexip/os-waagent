@@ -78,6 +78,7 @@ class ResourceDiskHandler(object):
             logger.error("Failed to mount resource disk {0}", e)
             add_event(name=AGENT_NAME, is_success=False, message=ustr(e),
                       op=WALAEventOperation.ActivateResourceDisk)
+        return None
 
     def enable_swap(self, mount_point):
         logger.info("Enable swap")
@@ -222,28 +223,28 @@ class ResourceDiskHandler(object):
             First try with --part-type; if fails, fall back to -c
         """
 
-        command_to_use = '--part-type'
-        input = "sfdisk {0} {1} {2}".format(
-            command_to_use, '-f' if suppress_message else '', option_str)
+        option_to_use = '--part-type'
+        command = "sfdisk {0} {1} {2}".format(
+            option_to_use, '-f' if suppress_message else '', option_str)
         err_code, output = shellutil.run_get_output(
-            input, chk_err=False, log_cmd=True)
+            command, chk_err=False, log_cmd=True)
 
         # fall back to -c
         if err_code != 0:
             logger.info(
                 "sfdisk with --part-type failed [{0}], retrying with -c",
                 err_code)
-            command_to_use = '-c'
-            input = "sfdisk {0} {1} {2}".format(
-                command_to_use, '-f' if suppress_message else '', option_str)
-            err_code, output = shellutil.run_get_output(input, log_cmd=True)
+            option_to_use = '-c'
+            command = "sfdisk {0} {1} {2}".format(
+                option_to_use, '-f' if suppress_message else '', option_str)
+            err_code, output = shellutil.run_get_output(command, log_cmd=True)
 
         if err_code == 0:
             logger.info('{0} succeeded',
-                        input)
+                        command)
         else:
             logger.error('{0} failed [{1}: {2}]',
-                         input,
+                         command,
                          err_code,
                          output)
 
@@ -333,7 +334,7 @@ class ResourceDiskHandler(object):
         # fallocate
         ret = 0
         fn_sh = shellutil.quote((filename,))
-        if self.fs != 'xfs':
+        if self.fs not in ['xfs', 'ext4']:
             # os.posix_fallocate
             if sys.version_info >= (3, 3):
                 # Probable errors:
@@ -346,7 +347,7 @@ class ResourceDiskHandler(object):
                         filename,
                         os.O_CREAT | os.O_WRONLY | os.O_EXCL,
                         stat.S_IRUSR | stat.S_IWUSR)
-                    os.posix_fallocate(fd, 0, nbytes)
+                    os.posix_fallocate(fd, 0, nbytes)  # pylint: disable=no-member
                     return 0
                 except BaseException:
                     # Not confident with this thing, just keep trying...
