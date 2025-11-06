@@ -1,3 +1,110 @@
+waagent (2.12.0.2-3) unstable; urgency=medium
+
+  * Add python3-crypt-r to runtime dependencies, not just build-deps
+
+ -- Noah Meyerhans <noahm@debian.org>  Tue, 22 Apr 2025 14:32:30 -0400
+
+waagent (2.12.0.2-2) unstable; urgency=medium
+
+  * Re-work a flakey test to be more reliable
+  * Use the crypt module from crypt_r (Closes: #1092518)
+
+ -- Noah Meyerhans <noahm@debian.org>  Fri, 18 Apr 2025 13:31:27 -0400
+
+waagent (2.12.0.2-1) unstable; urgency=medium
+
+  * New upstream version
+  * Update debian/watch
+
+ -- Noah Meyerhans <noahm@debian.org>  Thu, 14 Nov 2024 12:05:48 -0500
+
+waagent (2.12.0.2~pre-3) unstable; urgency=medium
+
+  * Add mount to build-deps (Closes: #1086013)
+
+ -- Noah Meyerhans <noahm@debian.org>  Mon, 28 Oct 2024 16:45:26 -0400
+
+waagent (2.12.0.2~pre-2) unstable; urgency=medium
+
+  * Add openssl to build-deps for tests (Closes: #1085958)
+
+ -- Noah Meyerhans <noahm@debian.org>  Thu, 24 Oct 2024 15:41:09 -0400
+
+waagent (2.12.0.2~pre-1) unstable; urgency=medium
+
+  * New upstream pre-release version 2.12.0.2 (Closes: #1083284, #1081679)
+  * Fix distro detection logic to avoid upstream bug #3214
+  * stop ignoring dh_auto_test failures
+  * Skip several tests that cannot pass in contrained build environments
+  * skip or fix some broken tests
+  * ensure autoupdate functionality is disabled
+  * Explicitly set the provisioning mode to "cloud-init"
+  * Update to standards version 4.7.0
+  * update vcs links to reflect team maintainership
+  * Add noahm to uploaders
+  * debian/control: update description
+  * override known lintian warnings
+  * Remove python3-pkg-resources from Depends (Closes: #1083986)
+
+ -- Noah Meyerhans <noahm@debian.org>  Fri, 11 Oct 2024 16:10:25 -0400
+
+waagent (2.9.1.1-2) unstable; urgency=medium
+
+  * Drop completely broken new systemd unit selection.
+    (closes: #1072878)
+  * Run tests during build, but ignore result.
+  * Fix missing Pre-Depends.
+
+ -- Bastian Blank <waldi@debian.org>  Sun, 09 Jun 2024 21:01:38 +0200
+
+waagent (2.9.1.1-1) unstable; urgency=medium
+
+  * New upstream version.
+  * Do not require root.
+  * Set maintainer to debian-cloud.
+  * Install udev files into /usr.  (closes: #1058825)
+
+ -- Bastian Blank <waldi@debian.org>  Wed, 05 Jun 2024 13:52:56 +0200
+
+waagent (2.7.3.0-4) unstable; urgency=medium
+
+  * Fix support for Kali Linux.  (closes: #1018288)
+
+ -- Bastian Blank <bastian.blank@credativ.de>  Tue, 04 Oct 2022 09:52:50 +0200
+
+waagent (2.7.3.0-3) unstable; urgency=medium
+
+  * Downgrade cloud-init to suggests, otherwise it's installed on existing
+    systems.
+
+ -- Bastian Blank <bastian.blank@credativ.de>  Wed, 28 Sep 2022 13:25:58 +0200
+
+waagent (2.7.3.0-2) unstable; urgency=medium
+
+  * Always use cloud-init for provisioning.
+
+ -- Bastian Blank <bastian.blank@credativ.de>  Mon, 05 Sep 2022 15:36:56 +0200
+
+waagent (2.7.3.0-1) unstable; urgency=medium
+
+  * New upstream version.
+  * Properly require distro module.
+  * Disable provisioning support completely.
+
+ -- Bastian Blank <bastian.blank@credativ.de>  Wed, 17 Aug 2022 15:53:09 +0200
+
+waagent (2.6.0.2-1) unstable; urgency=medium
+
+  * New upstream version.
+
+ -- Bastian Blank <bastian.blank@credativ.de>  Thu, 20 Jan 2022 12:01:44 +0100
+
+waagent (2.3.1.1-1) unstable; urgency=medium
+
+  * New upstream version.
+
+ -- Bastian Blank <bastian.blank@credativ.de>  Mon, 06 Sep 2021 11:56:54 +0200
+
 walinuxagent (2.2.47-2+pexip24u11) pexip; urgency=medium
 
   * Fix python SyntaxWarning in bigip.py

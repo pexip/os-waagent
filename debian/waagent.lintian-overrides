@@ -1,0 +1,2 @@
+waagent: maintainer-script-ignores-errors [preinst]
+waagent: no-manual-page [usr/sbin/waagent]

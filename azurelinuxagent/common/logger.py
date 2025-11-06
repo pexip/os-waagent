@@ -19,7 +19,7 @@ Log utils
 """
 import sys
 from datetime import datetime, timedelta
-from threading import currentThread
+from threading import current_thread
 
 from azurelinuxagent.common.future import ustr
 
@@ -36,11 +36,16 @@ class Logger(object):
     """
     Logger class
     """
+
+    # This format is based on ISO-8601, Z represents UTC (Zero offset)
+    LogTimeFormatInUTC = u'%Y-%m-%dT%H:%M:%S.%fZ'
+
     def __init__(self, logger=None, prefix=None):
         self.appenders = []
         self.logger = self if logger is None else logger
         self.periodic_messages = {}
         self.prefix = prefix
+        self.silent = False
 
     def reset_periodic(self):
         self.logger.periodic_messages = {}
@@ -83,7 +88,7 @@ class Logger(object):
         self.log(LogLevel.ERROR, msg_format, *args)
 
     def log(self, level, msg_format, *args):
-        def write_log(log_appender):
+        def write_log(log_appender):  # pylint: disable=W0612
             """
             The appender_lock flag is used to signal if the logger is currently in use. This prevents a subsequent log
             coming in due to writing of a log statement to be not written.
@@ -120,6 +125,9 @@ class Logger(object):
                 finally:
                     log_appender.appender_lock = False
 
+        if self.silent:
+            return
+
         # if msg_format is not unicode convert it to unicode
         if type(msg_format) is not ustr:
             msg_format = ustr(msg_format, errors="backslashreplace")
@@ -127,10 +135,9 @@ class Logger(object):
             msg = msg_format.format(*args)
         else:
             msg = msg_format
-            # This format is based on ISO-8601, Z represents UTC (Zero offset)
-        time = datetime.utcnow().strftime(u'%Y-%m-%dT%H:%M:%S.%fZ')
+        time = datetime.utcnow().strftime(Logger.LogTimeFormatInUTC)
         level_str = LogLevel.STRINGS[level]
-        thread_name = currentThread().getName()
+        thread_name = current_thread().name
         if self.prefix is not None:
             log_item = u"{0} {1} {2} {3} {4}\n".format(time, level_str, thread_name, self.prefix, msg)
         else:
@@ -161,6 +168,18 @@ class Logger(object):
     def add_appender(self, appender_type, level, path):
         appender = _create_logger_appender(appender_type, level, path)
         self.appenders.append(appender)
+
+    def console_output_enabled(self):
+        """
+        Returns True if the current list of appenders includes at least one ConsoleAppender
+        """
+        return any(isinstance(appender, ConsoleAppender) for appender in self.appenders)
+
+    def disable_console_output(self):
+        """
+        Removes all ConsoleAppenders from the current list of appenders
+        """
+        self.appenders = [appender for appender in self.appenders if not isinstance(appender, ConsoleAppender)]
 
 
 class Appender(object):
@@ -201,7 +220,7 @@ class FileAppender(Appender):
 
 
 class StdoutAppender(Appender):
-    def __init__(self, level):
+    def __init__(self, level):  # pylint: disable=W0235
         super(StdoutAppender, self).__init__(level)
 
     def write(self, level, msg):
@@ -251,6 +270,14 @@ class AppenderType(object):
 
 def add_logger_appender(appender_type, level=LogLevel.INFO, path=None):
     DEFAULT_LOGGER.add_appender(appender_type, level, path)
+
+
+def console_output_enabled():
+    return DEFAULT_LOGGER.console_output_enabled()
+
+
+def disable_console_output():
+    DEFAULT_LOGGER.disable_console_output()
 
 
 def reset_periodic():

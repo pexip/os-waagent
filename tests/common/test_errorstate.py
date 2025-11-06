@@ -1,7 +1,8 @@
 import unittest
+from datetime import timedelta, datetime
 
-from azurelinuxagent.common.errorstate import *
-from tests.tools import Mock, patch
+from azurelinuxagent.common.errorstate import ErrorState
+from tests.lib.tools import Mock, patch
 
 
 class TestErrorState(unittest.TestCase):

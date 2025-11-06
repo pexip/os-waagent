@@ -27,8 +27,8 @@ IMDS_CONNECTION_ERROR = 2
 IMDS_INTERNAL_SERVER_ERROR = 3
 
 
-def get_imds_client(wireserver_endpoint):
-    return ImdsClient(wireserver_endpoint)
+def get_imds_client():
+    return ImdsClient()
 
 
 # A *slightly* future proof list of endorsed distros.
@@ -112,28 +112,45 @@ ENDORSED_IMAGE_INFO_MATCHER_JSON = """{
         "SLES-BYOS": {
             "List": [
                 "11-SP4",
-                "11-SP5",
-                "11-SP6",
+                 "12",
                 "12-SP1",
                 "12-SP2",
                 "12-SP3",
                 "12-SP4",
                 "12-SP5",
-                "12-SP6"
+                "15",
+                "15-SP1",
+                "15-SP2",
+                "15-SP3",
+                "15-SP4",
+                "15-SP5"
             ]
         },
         "SLES-SAP": {
             "List": [
                 "11-SP4",
-                "11-SP5",
-                "11-SP6",
+                "12",
                 "12-SP1",
                 "12-SP2",
                 "12-SP3",
                 "12-SP4",
                 "12-SP5",
-                "12-SP6"
+                "15",
+                "15-SP1",
+                "15-SP2",
+                "15-SP3",
+                "15-SP4",
+                "15-SP5"
             ]
+        },
+        "SLE-HPC": {
+           "List": [
+               "15-SP1",
+               "15-SP2",
+                "15-SP3",
+                "15-SP4",
+                "15-SP5"
+           ]
         }
     }
 }"""
@@ -239,7 +256,7 @@ class ComputeInfo(DataContract):
 
 
 class ImdsClient(object):
-    def __init__(self, wireserver_endpoint, version=APIVERSION):
+    def __init__(self, version=APIVERSION):
         self._api_version = version
         self._headers = {
             'User-Agent': restutil.HTTP_USER_AGENT,
@@ -251,7 +268,6 @@ class ImdsClient(object):
         }
         self._regex_ioerror = re.compile(r".*HTTP Failed. GET http://[^ ]+ -- IOError .*")
         self._regex_throttled = re.compile(r".*HTTP Retry. GET http://[^ ]+ -- Status Code 429 .*")
-        self._wireserver_endpoint = wireserver_endpoint
 
     def _get_metadata_url(self, endpoint, resource_path):
         return BASE_METADATA_URI.format(endpoint, resource_path, self._api_version)
@@ -288,11 +304,11 @@ class ImdsClient(object):
 
         if resp.status >= 500:
             return IMDS_INTERNAL_SERVER_ERROR, "IMDS error in /metadata/{0}: {1}".format(
-                                               resource_path, restutil.read_response_error(resp))
+                                               resource_path, restutil.read_response_error(resp)) 
 
         if restutil.request_failed(resp):
             return IMDS_RESPONSE_ERROR, "IMDS error in /metadata/{0}: {1}".format(
-                                        resource_path, restutil.read_response_error(resp))
+                                        resource_path, restutil.read_response_error(resp)) 
 
         return IMDS_RESPONSE_SUCCESS, resp.read()
 
@@ -309,14 +325,12 @@ class ImdsClient(object):
         endpoint = IMDS_ENDPOINT
 
         status, resp = self._get_metadata_from_endpoint(endpoint, resource_path, headers)
-        if status == IMDS_CONNECTION_ERROR:
-            endpoint = self._wireserver_endpoint
-            status, resp = self._get_metadata_from_endpoint(endpoint, resource_path, headers)
 
         if status == IMDS_RESPONSE_SUCCESS:
             return MetadataResult(True, False, resp)
         elif status == IMDS_INTERNAL_SERVER_ERROR:
             return MetadataResult(False, True, resp)
+        # else it's a client-side error, e.g. IMDS_CONNECTION_ERROR
         return MetadataResult(False, False, resp)
 
     def get_compute(self):

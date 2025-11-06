@@ -16,6 +16,8 @@
 # Requires Python 2.6+ and Openssl 1.0+
 #
 
+import glob
+import textwrap
 import time
 
 import azurelinuxagent.common.logger as logger
@@ -39,10 +41,18 @@ class Ubuntu14OSUtil(DefaultOSUtil):
         return shellutil.run("service networking start", chk_err=False)
 
     def stop_agent_service(self):
-        return shellutil.run("service {0} stop".format(self.service_name), chk_err=False)
+        try:
+            shellutil.run_command(["service", self.service_name, "stop"])
+        except shellutil.CommandError as cmd_err:
+            return cmd_err.returncode
+        return 0
 
     def start_agent_service(self):
-        return shellutil.run("service {0} start".format(self.service_name), chk_err=False)
+        try:
+            shellutil.run_command(["service", self.service_name, "start"])
+        except shellutil.CommandError as cmd_err:
+            return cmd_err.returncode
+        return 0
 
     def remove_rules_files(self, rules_files=""):
         pass
@@ -55,15 +65,12 @@ class Ubuntu14OSUtil(DefaultOSUtil):
 
 
 class Ubuntu12OSUtil(Ubuntu14OSUtil):
-    def __init__(self):
+    def __init__(self):  # pylint: disable=W0235
         super(Ubuntu12OSUtil, self).__init__()
 
     # Override
     def get_dhcp_pid(self):
         return self._get_dhcp_pid(["pidof", "dhclient3"])
-
-    def mount_cgroups(self):
-        pass
 
 
 class Ubuntu16OSUtil(Ubuntu14OSUtil):
@@ -80,20 +87,31 @@ class Ubuntu16OSUtil(Ubuntu14OSUtil):
     def unregister_agent_service(self):
         return shellutil.run("systemctl mask {0}".format(self.service_name), chk_err=False)
 
-    def mount_cgroups(self):
-        """
-        Mounted by default in Ubuntu 16.04
-        """
-        pass
-
 
 class Ubuntu18OSUtil(Ubuntu16OSUtil):
     """
-    Ubuntu 18.04
+    Ubuntu >=18.04 and <=24.04
     """
     def __init__(self):
         super(Ubuntu18OSUtil, self).__init__()
         self.service_name = self.get_service_name()
+
+    def restart_if(self, ifname, retries=3, wait=5):
+        """
+        Restart systemd-networkd
+        """
+        retry_limit=retries+1
+        for attempt in range(1, retry_limit):
+            try:
+                shellutil.run_command(["systemctl", "restart", "systemd-networkd"])
+
+            except shellutil.CommandError as cmd_err:
+                logger.warn("failed to restart systemd-networkd: return code {1}".format(cmd_err.returncode))
+                if attempt < retry_limit:
+                    logger.info("retrying in {0} seconds".format(wait))
+                    time.sleep(wait)
+                else:
+                    logger.warn("exceeded restart retries")
 
     def get_dhcp_pid(self):
         return self._get_dhcp_pid(["pidof", "systemd-networkd"])
@@ -116,9 +134,33 @@ class Ubuntu18OSUtil(Ubuntu16OSUtil):
     def stop_agent_service(self):
         return shellutil.run("systemctl stop {0}".format(self.service_name), chk_err=False)
 
+    def get_dhcp_lease_endpoint(self):
+        pathglob = "/run/systemd/netif/leases/*"
+        logger.info("looking for leases in path [{0}]".format(pathglob))
+        endpoint = None
+        for lease_file in glob.glob(pathglob):
+            try:
+                with open(lease_file) as f:
+                    lease = f.read()
+                for line in lease.splitlines():
+                    if line.startswith("OPTION_245"):
+                        option_245 = line.split("=")[1]
+                        options = [int(i, 16) for i in textwrap.wrap(option_245, 2)]
+                        endpoint = "{0}.{1}.{2}.{3}".format(*options)
+                        logger.info("found endpoint [{0}]".format(endpoint))
+            except Exception as e:
+                logger.info(
+                    "Failed to parse {0}: {1}".format(lease_file, str(e))
+                )
+        if endpoint is not None:
+            logger.info("cached endpoint found [{0}]".format(endpoint))
+        else:
+            logger.info("cached endpoint not found")
+        return endpoint
+
 
 class UbuntuOSUtil(Ubuntu16OSUtil):
-    def __init__(self):
+    def __init__(self):  # pylint: disable=W0235
         super(UbuntuOSUtil, self).__init__()
 
     def restart_if(self, ifname, retries=3, wait=5):
@@ -126,9 +168,9 @@ class UbuntuOSUtil(Ubuntu16OSUtil):
         Restart an interface by bouncing the link. systemd-networkd observes
         this event, and forces a renew of DHCP.
         """
-        retry_limit=retries+1
+        retry_limit = retries+1
         for attempt in range(1, retry_limit):
-            return_code=shellutil.run("ip link set {0} down && ip link set {0} up".format(ifname))
+            return_code = shellutil.run("ip link set {0} down && ip link set {0} up".format(ifname))
             if return_code == 0:
                 return
             logger.warn("failed to restart {0}: return code {1}".format(ifname, return_code))

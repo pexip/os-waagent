@@ -1,2 +1,4 @@
-version=3
-https://github.com/Azure/WALinuxAgent/releases	/Azure/WALinuxAgent/archive/WALinuxAgent-([\d\.]+)\.tar\.gz	debian uupdate
+version=4
+opts="filenamemangle=s%(?:.*?)?v?@ANY_VERSION@(@ARCHIVE_EXT@)%@PACKAGE@-$1$2%" \
+  https://github.com/azure/WALinuxAgent/tags \
+(?:.*?/)?v?@ANY_VERSION@@ARCHIVE_EXT@

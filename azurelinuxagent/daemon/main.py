@@ -20,19 +20,18 @@
 import os
 import sys
 import time
-import traceback
 
 import azurelinuxagent.common.conf as conf
 import azurelinuxagent.common.logger as logger
 import azurelinuxagent.common.utils.fileutil as fileutil
 
-from azurelinuxagent.common.cgroupconfigurator import CGroupConfigurator
 from azurelinuxagent.common.event import add_event, WALAEventOperation, initialize_event_logger_vminfo_common_parameters
 from azurelinuxagent.common.future import ustr
 from azurelinuxagent.common.osutil import get_osutil
+from azurelinuxagent.common.protocol.goal_state import GoalState, GoalStateProperties
 from azurelinuxagent.common.protocol.util import get_protocol_util
-from azurelinuxagent.common.protocol.wire import WireProtocol
-from azurelinuxagent.common.rdma import setup_rdma_device
+from azurelinuxagent.pa.rdma.rdma import setup_rdma_device
+from azurelinuxagent.common.utils import textutil
 from azurelinuxagent.common.version import AGENT_NAME, AGENT_LONG_NAME, \
     AGENT_VERSION, \
     DISTRO_NAME, DISTRO_VERSION, PY_VERSION_MAJOR, PY_VERSION_MINOR, \
@@ -66,7 +65,7 @@ class DaemonHandler(object):
         #
         # Be aware that telemetry events emitted before that will not include the Container ID.
         #
-        logger.info("{0} Version:{1}", AGENT_LONG_NAME, AGENT_VERSION)
+        logger.info("{0} Version: {1}", AGENT_LONG_NAME, AGENT_VERSION)
         logger.info("OS: {0} {1}", DISTRO_NAME, DISTRO_VERSION)
         logger.info("Python: {0}.{1}.{2}", PY_VERSION_MAJOR, PY_VERSION_MINOR, PY_VERSION_MICRO)
 
@@ -82,8 +81,8 @@ class DaemonHandler(object):
         while self.running:
             try:
                 self.daemon(child_args)
-            except Exception as e:
-                err_msg = traceback.format_exc()
+            except Exception as e:  # pylint: disable=W0612
+                err_msg = textutil.format_exception(e)
                 add_event(name=AGENT_NAME, is_success=False, message=ustr(err_msg),
                           op=WALAEventOperation.UnhandledError)
                 logger.warn("Daemon ended with exception -- Sleep 15 seconds and restart daemon")
@@ -106,9 +105,8 @@ class DaemonHandler(object):
         agent_disabled_file_path = conf.get_disable_agent_file_path()
         if os.path.exists(agent_disabled_file_path):
             import threading
-            logger.warn("Disabling the guest agent by sleeping forever; "
-                        "to re-enable, remove {0} and restart"
-                        .format(agent_disabled_file_path))
+            logger.warn("Disabling the guest agent by sleeping forever; to re-enable, remove {0} and restart".format(agent_disabled_file_path))
+            logger.warn("To enable VM extensions, also ensure that the VM's osProfile.allowExtensionOperations property is set to true.")
             self.running = False
             disable_event = threading.Event()
             disable_event.wait()
@@ -126,12 +124,12 @@ class DaemonHandler(object):
     def daemon(self, child_args=None):
         logger.info("Run daemon")
 
-        self.protocol_util = get_protocol_util()
-        self.scvmm_handler = get_scvmm_handler()
-        self.resourcedisk_handler = get_resourcedisk_handler()
-        self.rdma_handler = get_rdma_handler()
-        self.provision_handler = get_provision_handler()
-        self.update_handler = get_update_handler()
+        self.protocol_util = get_protocol_util()  # pylint: disable=W0201
+        self.scvmm_handler = get_scvmm_handler()  # pylint: disable=W0201
+        self.resourcedisk_handler = get_resourcedisk_handler()  # pylint: disable=W0201
+        self.rdma_handler = get_rdma_handler()  # pylint: disable=W0201
+        self.provision_handler = get_provision_handler()  # pylint: disable=W0201
+        self.update_handler = get_update_handler()  # pylint: disable=W0201
 
         if conf.get_detect_scvmm_env():
             self.scvmm_handler.run()
@@ -149,9 +147,6 @@ class DaemonHandler(object):
         # that require the goal state and IMDS
         self._initialize_telemetry()
 
-        # Initialize the agent cgroup
-        CGroupConfigurator.get_instance().create_agent_cgroups(track_cgroups=False)
-
         # Enable RDMA, continue in errors
         if conf.enable_rdma():
             nd_version = self.rdma_handler.get_rdma_version()
@@ -164,18 +159,21 @@ class DaemonHandler(object):
                 #   incarnation number. A forced update ensures the most
                 #   current values.
                 protocol = self.protocol_util.get_protocol()
-                if type(protocol) is not WireProtocol:
-                    raise Exception("Attempt to setup RDMA without Wireserver")
 
-                protocol.client.update_goal_state(forced=True)
+                goal_state = GoalState(protocol.client, goal_state_properties=GoalStateProperties.SharedConfig)
 
-                setup_rdma_device(nd_version, protocol.client.get_shared_conf())
+                setup_rdma_device(nd_version, goal_state.shared_conf)
             except Exception as e:
                 logger.error("Error setting up rdma device: %s" % e)
         else:
             logger.info("RDMA capabilities are not enabled, skipping")
 
         self.sleep_if_disabled()
+
+        # Disable output to /dev/console once provisioning has completed
+        if logger.console_output_enabled():
+            logger.info("End of log to /dev/console. The agent will now check for updates and then will process extensions.")
+            logger.disable_console_output()
 
         while self.running:
             self.update_handler.run_latest(child_args=child_args)

@@ -1,0 +1,10 @@
+#!/bin/sh
+
+if [ "$1" = "upgrade" ]; then
+        if [ -x "/usr/bin/deb-systemd-helper" ]; then
+                deb-systemd-helper purge 'waagent-apt.service' >/dev/null || true
+                deb-systemd-helper unmask 'waagent-apt.service' >/dev/null || true
+        fi
+fi
+
+#DEBHELPER#

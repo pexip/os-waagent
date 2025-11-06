@@ -21,7 +21,6 @@ import os
 import re
 import threading
 import time
-import traceback
 import socket
 import struct
 
@@ -56,6 +55,15 @@ RETRY_CODES = [
     httpclient.INSUFFICIENT_STORAGE,
     429,  # Request Rate Limit Exceeded
 ]
+
+#
+# Currently the HostGAPlugin has an issue its cache that may produce a BAD_REQUEST failure for valid URIs when using the extensionArtifact API.
+# Add this status to the retryable codes, but use it only when requesting downloads via the HostGAPlugin. The retry logic in the download code
+# would give enough time to the HGAP to refresh its cache. Once the fix to address that issue is deployed, consider removing the use of
+# HGAP_GET_EXTENSION_ARTIFACT_RETRY_CODES.
+#
+HGAP_GET_EXTENSION_ARTIFACT_RETRY_CODES = RETRY_CODES[:]  # make a copy of RETRY_CODES
+HGAP_GET_EXTENSION_ARTIFACT_RETRY_CODES.append(httpclient.BAD_REQUEST)
 
 RESOURCE_GONE_CODES = [
     httpclient.GONE
@@ -137,12 +145,14 @@ class IOErrorCounter(object):
 
 def _compute_delay(retry_attempt=1, delay=DELAY_IN_SECONDS):
     fib = (1, 1)
-    for n in range(retry_attempt):
+    for _ in range(retry_attempt):
         fib = (fib[1], fib[0]+fib[1])
     return delay*fib[1]
 
 
-def _is_retry_status(status, retry_codes=RETRY_CODES):
+def _is_retry_status(status, retry_codes=None):
+    if retry_codes is None:
+        retry_codes = RETRY_CODES
     return status in retry_codes
 
 
@@ -170,6 +180,19 @@ def _parse_url(url):
         secure = True
     return o.hostname, o.port, secure, rel_uri
 
+def _trim_url_parameters(url):
+    """
+    Parse URL and return scheme://hostname:port/path
+    """
+    o = urlparse(url)
+
+    if o.hostname:
+        if o.port:
+            return "{0}://{1}:{2}{3}".format(o.scheme, o.hostname, o.port, o.path)
+        else:
+            return "{0}://{1}{2}".format(o.scheme, o.hostname, o.path)
+
+    return url
 
 def is_valid_cidr(string_network):
     """
@@ -286,8 +309,8 @@ def redact_sas_tokens_in_urls(url):
     return SAS_TOKEN_RETRIEVAL_REGEX.sub(r"\1" + REDACTED_TEXT + r"\3", url)
 
 
-def _http_request(method, host, rel_uri, port=None, data=None, secure=False,
-                  headers=None, proxy_host=None, proxy_port=None):
+def _http_request(method, host, rel_uri, timeout, port=None, data=None, secure=False,
+                  headers=None, proxy_host=None, proxy_port=None, redact_data=False):
 
     headers = {} if headers is None else headers
     headers['Connection'] = 'close'
@@ -311,18 +334,23 @@ def _http_request(method, host, rel_uri, port=None, data=None, secure=False,
     if secure:
         conn = httpclient.HTTPSConnection(conn_host,
                                           conn_port,
-                                          timeout=10)
+                                          timeout=timeout)
         if use_proxy:
             conn.set_tunnel(host, port)
     else:
         conn = httpclient.HTTPConnection(conn_host,
                                          conn_port,
-                                         timeout=10)
+                                         timeout=timeout)
 
+    payload = data
+    if redact_data:
+        payload = "[REDACTED]"
+
+    # Logger requires the msg to be a ustr to log properly, ensuring that the data string that we log is always ustr
     logger.verbose("HTTP connection [{0}] [{1}] [{2}] [{3}]",
                    method,
                    redact_sas_tokens_in_urls(url),
-                   data,
+                   textutil.str_to_encoded_ustr(payload),
                    headers)
 
     conn.request(method=method, url=url, body=data, headers=headers)
@@ -330,13 +358,26 @@ def _http_request(method, host, rel_uri, port=None, data=None, secure=False,
 
 
 def http_request(method,
-                url, data, headers=None,
-                use_proxy=False,
-                max_retry=DEFAULT_RETRIES,
-                retry_codes=RETRY_CODES,
-                retry_delay=DELAY_IN_SECONDS):
+                 url, data, timeout,
+                 headers=None,
+                 use_proxy=False,
+                 max_retry=None,
+                 retry_codes=None,
+                 retry_delay=DELAY_IN_SECONDS,
+                 redact_data=False,
+                 return_raw_response=False):
+    """
+    NOTE: This method provides some logic to handle errors in the HTTP request, including checking the HTTP status of the response
+          and handling some exceptions. If return_raw_response is set to True all the error handling will be skipped and the
+          method will return the actual HTTP response and bubble up any exceptions while issuing the request. Also note that if
+        return_raw_response is True no retries will be done.
+    """
 
-    global SECURE_WARNING_EMITTED
+    if max_retry is None:
+        max_retry = DEFAULT_RETRIES
+    if retry_codes is None:
+        retry_codes = RETRY_CODES
+    global SECURE_WARNING_EMITTED  # pylint: disable=W0603
 
     host, port, secure, rel_uri = _parse_url(url)
 
@@ -392,11 +433,11 @@ def http_request(method,
                                             delay=retry_delay)
 
             logger.verbose("[HTTP Retry] "
-                        "Attempt {0} of {1} will delay {2} seconds: {3}",
-                        attempt+1,
-                        max_retry,
-                        delay,
-                        msg)
+                        "Attempt {0} of {1} will delay {2} seconds: {3}", 
+                        attempt+1, 
+                        max_retry, 
+                        delay, 
+                        msg) 
 
             time.sleep(delay)
 
@@ -406,13 +447,19 @@ def http_request(method,
             resp = _http_request(method,
                                  host,
                                  rel_uri,
+                                 timeout,
                                  port=port,
                                  data=data,
                                  secure=secure,
                                  headers=headers,
                                  proxy_host=proxy_host,
-                                 proxy_port=proxy_port)
+                                 proxy_port=proxy_port,
+                                 redact_data=redact_data)
+
             logger.verbose("[HTTP Response] Status Code {0}", resp.status)
+
+            if return_raw_response:  # skip all error handling
+                return resp
 
             if request_failed(resp):
                 if _is_retry_status(resp.status, retry_codes=retry_codes):
@@ -440,15 +487,19 @@ def http_request(method,
             return resp
 
         except httpclient.HTTPException as e:
-            clean_url = redact_sas_tokens_in_urls(url)
+            if return_raw_response:  # skip all error handling
+                raise
+            clean_url = _trim_url_parameters(url)
             msg = '[HTTP Failed] {0} {1} -- HttpException {2}'.format(method, clean_url, e)
             if _is_retry_exception(e):
                 continue
             break
 
         except IOError as e:
+            if return_raw_response:  # skip all error handling
+                raise
             IOErrorCounter.increment(host=host, port=port)
-            clean_url = redact_sas_tokens_in_urls(url)
+            clean_url = _trim_url_parameters(url)
             msg = '[HTTP Failed] {0} {1} -- IOError {2}'.format(method, clean_url, e)
             continue
 
@@ -458,27 +509,47 @@ def http_request(method,
 def http_get(url,
              headers=None,
              use_proxy=False,
-             max_retry=DEFAULT_RETRIES,
-             retry_codes=RETRY_CODES,
-             retry_delay=DELAY_IN_SECONDS):
+             max_retry=None,
+             retry_codes=None,
+             retry_delay=DELAY_IN_SECONDS,
+             return_raw_response=False,
+             timeout=10):
+    """
+    NOTE: This method provides some logic to handle errors in the HTTP request, including checking the HTTP status of the response
+          and handling some exceptions. If return_raw_response is set to True all the error handling will be skipped and the
+          method will return the actual HTTP response and bubble up any exceptions while issuing the request. Also note that if
+          return_raw_response is True no retries will be done.
+    """
 
+    if max_retry is None:
+        max_retry = DEFAULT_RETRIES
+    if retry_codes is None:
+        retry_codes = RETRY_CODES
     return http_request("GET",
-                        url, None, headers=headers,
+                        url, None, timeout,
+                        headers=headers,
                         use_proxy=use_proxy,
                         max_retry=max_retry,
                         retry_codes=retry_codes,
-                        retry_delay=retry_delay)
+                        retry_delay=retry_delay,
+                        return_raw_response=return_raw_response)
 
 
 def http_head(url,
               headers=None,
               use_proxy=False,
-              max_retry=DEFAULT_RETRIES,
-              retry_codes=RETRY_CODES,
-              retry_delay=DELAY_IN_SECONDS):
+              max_retry=None,
+              retry_codes=None,
+              retry_delay=DELAY_IN_SECONDS,
+              timeout=10):
 
+    if max_retry is None:
+        max_retry = DEFAULT_RETRIES
+    if retry_codes is None:
+        retry_codes = RETRY_CODES
     return http_request("HEAD",
-                        url, None, headers=headers,
+                        url, None, timeout,
+                        headers=headers,
                         use_proxy=use_proxy,
                         max_retry=max_retry,
                         retry_codes=retry_codes,
@@ -489,12 +560,18 @@ def http_post(url,
               data,
               headers=None,
               use_proxy=False,
-              max_retry=DEFAULT_RETRIES,
-              retry_codes=RETRY_CODES,
-              retry_delay=DELAY_IN_SECONDS):
+              max_retry=None,
+              retry_codes=None,
+              retry_delay=DELAY_IN_SECONDS,
+              timeout=10):
 
+    if max_retry is None:
+        max_retry = DEFAULT_RETRIES
+    if retry_codes is None:
+        retry_codes = RETRY_CODES
     return http_request("POST",
-                        url, data, headers=headers,
+                        url, data, timeout,
+                        headers=headers,
                         use_proxy=use_proxy,
                         max_retry=max_retry,
                         retry_codes=retry_codes,
@@ -505,38 +582,56 @@ def http_put(url,
              data,
              headers=None,
              use_proxy=False,
-             max_retry=DEFAULT_RETRIES,
-             retry_codes=RETRY_CODES,
-             retry_delay=DELAY_IN_SECONDS):
+             max_retry=None,
+             retry_codes=None,
+             retry_delay=DELAY_IN_SECONDS,
+             redact_data=False,
+             timeout=10):
 
+    if max_retry is None:
+        max_retry = DEFAULT_RETRIES
+    if retry_codes is None:
+        retry_codes = RETRY_CODES
     return http_request("PUT",
-                        url, data, headers=headers,
+                        url, data, timeout,
+                        headers=headers,
                         use_proxy=use_proxy,
                         max_retry=max_retry,
                         retry_codes=retry_codes,
-                        retry_delay=retry_delay)
+                        retry_delay=retry_delay,
+                        redact_data=redact_data)
 
 
 def http_delete(url,
                 headers=None,
                 use_proxy=False,
-                max_retry=DEFAULT_RETRIES,
-                retry_codes=RETRY_CODES,
-                retry_delay=DELAY_IN_SECONDS):
+                max_retry=None,
+                retry_codes=None,
+                retry_delay=DELAY_IN_SECONDS,
+                timeout=10):
 
+    if max_retry is None:
+        max_retry = DEFAULT_RETRIES
+    if retry_codes is None:
+        retry_codes = RETRY_CODES
     return http_request("DELETE",
-                        url, None, headers=headers,
+                        url, None, timeout,
+                        headers=headers,
                         use_proxy=use_proxy,
                         max_retry=max_retry,
                         retry_codes=retry_codes,
                         retry_delay=retry_delay)
 
 
-def request_failed(resp, ok_codes=OK_CODES):
+def request_failed(resp, ok_codes=None):
+    if ok_codes is None:
+        ok_codes = OK_CODES
     return not request_succeeded(resp, ok_codes=ok_codes)
 
 
-def request_succeeded(resp, ok_codes=OK_CODES):
+def request_succeeded(resp, ok_codes=None):
+    if ok_codes is None:
+        ok_codes = OK_CODES
     return resp is not None and resp.status in ok_codes
 
 
@@ -544,10 +639,12 @@ def request_not_modified(resp):
     return resp is not None and resp.status in NOT_MODIFIED_CODES
 
 
-def request_failed_at_hostplugin(resp, upstream_failure_codes=HOSTPLUGIN_UPSTREAM_FAILURE_CODES):
+def request_failed_at_hostplugin(resp, upstream_failure_codes=None):
     """
     Host plugin will return 502 for any upstream issue, so a failure is any 5xx except 502
     """
+    if upstream_failure_codes is None:
+        upstream_failure_codes = HOSTPLUGIN_UPSTREAM_FAILURE_CODES
     return resp is not None and resp.status >= 500 and resp.status not in upstream_failure_codes
 
 
@@ -556,9 +653,9 @@ def read_response_error(resp):
     if resp is not None:
         try:
             result = "[HTTP Failed] [{0}: {1}] {2}".format(
-                        resp.status,
-                        resp.reason,
-                        resp.read())
+                        resp.status, 
+                        resp.reason, 
+                        resp.read()) 
 
             # this result string is passed upstream to several methods
             # which do a raise HttpError() or a format() of some kind;
@@ -572,6 +669,6 @@ def read_response_error(resp):
 
             result = textutil.replace_non_ascii(result)
 
-        except Exception:
-            logger.warn(traceback.format_exc())
+        except Exception as e:
+            logger.warn(textutil.format_exception(e))
     return result

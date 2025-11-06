@@ -19,11 +19,11 @@
 
 """
 Module conf loads and parses configuration file
-"""
+"""  # pylint: disable=W0105
 import os
 import os.path
 
-import azurelinuxagent.common.utils.fileutil as fileutil
+from azurelinuxagent.common.utils.fileutil import read_file #pylint: disable=R0401
 from azurelinuxagent.common.exception import AgentConfigError
 
 DISABLE_AGENT_FILE = 'disable_agent'
@@ -35,7 +35,7 @@ class ConfigurationProvider(object):
     """
 
     def __init__(self):
-        self.values = dict()
+        self.values = {}
 
     def load(self, content):
         if not content:
@@ -49,25 +49,49 @@ class ConfigurationProvider(object):
                 value = parts[1].split('#')[0].strip("\" ").strip()
                 self.values[key] = value if value != "None" else None
 
-    def get(self, key, default_val):
-        val = self.values.get(key)
-        return val if val is not None else default_val
+    @staticmethod
+    def _get_default(default):
+        if hasattr(default, '__call__'):
+            return default()
+        return default
 
-    def get_switch(self, key, default_val):
+    def get(self, key, default_value):
+        """
+        Retrieves a string parameter by key and returns its value. If not found returns the default value,
+        or if the default value is a callable returns the result of invoking the callable.
+        """
+        val = self.values.get(key)
+        return val if val is not None else self._get_default(default_value)
+
+    def get_switch(self, key, default_value):
+        """
+        Retrieves a switch parameter by key and returns its value as a boolean. If not found returns the default value,
+        or if the default value is a callable returns the result of invoking the callable.
+        """
         val = self.values.get(key)
         if val is not None and val.lower() == 'y':
             return True
         elif val is not None and val.lower() == 'n':
             return False
-        return default_val
+        return self._get_default(default_value)
 
-    def get_int(self, key, default_val):
+    def get_int(self, key, default_value):
+        """
+        Retrieves an int parameter by key and returns its value. If not found returns the default value,
+        or if the default value is a callable returns the result of invoking the callable.
+        """
         try:
             return int(self.values.get(key))
         except TypeError:
-            return default_val
+            return self._get_default(default_value)
         except ValueError:
-            return default_val
+            return self._get_default(default_value)
+
+    def is_present(self, key):
+        """
+        Returns True if the given flag present in the configuration file, False otherwise.
+        """
+        return self.values.get(key) is not None
 
 
 __conf__ = ConfigurationProvider()
@@ -81,7 +105,7 @@ def load_conf_from_file(conf_file_path, conf=__conf__):
         raise AgentConfigError(("Missing configuration in {0}"
                                 "").format(conf_file_path))
     try:
-        content = fileutil.read_file(conf_file_path)
+        content = read_file(conf_file_path)
         conf.load(content)
     except IOError as err:
         raise AgentConfigError(("Failed to load conf file:{0}, {1}"
@@ -97,7 +121,9 @@ __SWITCH_OPTIONS__ = {
     "OS.CheckRdmaDriver": False,
     "Logs.Verbose": False,
     "Logs.Console": True,
+    "Logs.Collect": True,
     "Extensions.Enabled": True,
+    "Extensions.WaitForCloudInit": False,
     "Provisioning.AllowResetSysUser": False,
     "Provisioning.RegenerateSshHostKeyPair": False,
     "Provisioning.DeleteRootPassword": False,
@@ -109,8 +135,19 @@ __SWITCH_OPTIONS__ = {
     "ResourceDisk.EnableSwap": False,
     "ResourceDisk.EnableSwapEncryption": False,
     "AutoUpdate.Enabled": True,
+    "AutoUpdate.UpdateToLatestVersion": True,
     "EnableOverProvisioning": True,
-    "CGroups.EnforceLimits": False,
+    #
+    # "Debug" options are experimental and may be removed in later
+    # versions of the Agent.
+    #
+    "Debug.CgroupLogMetrics": False,
+    "Debug.CgroupDisableOnProcessCheckFailure": True,
+    "Debug.CgroupDisableOnQuotaCheckFailure": True,
+    "Debug.EnableAgentMemoryUsageCheck": False,
+    "Debug.EnableFastTrack": True,
+    "Debug.EnableGAVersioning": True,
+    "Debug.EnableCgroupV2ResourceLimiting": False
 }
 
 
@@ -133,16 +170,39 @@ __STRING_OPTIONS__ = {
     "ResourceDisk.MountOptions": None,
     "ResourceDisk.Filesystem": "ext3",
     "AutoUpdate.GAFamily": "Prod",
-    "CGroups.Excluded": "customscript,runcommand",
+    "Debug.CgroupMonitorExpiryTime": "2022-03-31",
+    "Debug.CgroupMonitorExtensionName": "Microsoft.Azure.Monitor.AzureMonitorLinuxAgent",
 }
 
 
 __INTEGER_OPTIONS__ = {
+    "Extensions.GoalStatePeriod": 6,
+    "Extensions.InitialGoalStatePeriod": 6,
+    "Extensions.WaitForCloudInitTimeout": 3600,
+    "OS.EnableFirewallPeriod": 300,
+    "OS.RemovePersistentNetRulesPeriod": 30,
+    "OS.RootDeviceScsiTimeoutPeriod": 30,
+    "OS.MonitorDhcpClientRestartPeriod": 30,
     "OS.SshClientAliveInterval": 180,
+    "Provisioning.MonitorHostNamePeriod": 30,
     "Provisioning.PasswordCryptSaltLength": 10,
     "HttpProxy.Port": None,
     "ResourceDisk.SwapSizeMB": 0,
-    "Autoupdate.Frequency": 3600
+    "Autoupdate.Frequency": 3600,
+    "Logs.CollectPeriod": 3600,
+    #
+    # "Debug" options are experimental and may be removed in later
+    # versions of the Agent.
+    #
+    "Debug.CgroupCheckPeriod": 300,
+    "Debug.AgentCpuQuota": 50,
+    "Debug.AgentCpuThrottledTimeThreshold": 120,
+    "Debug.AgentMemoryQuota": 30 * 1024 ** 2,
+    "Debug.EtpCollectionPeriod": 300,
+    "Debug.AutoUpdateHotfixFrequency": 14400,
+    "Debug.AutoUpdateNormalFrequency": 86400,
+    "Debug.FirewallRulesLogPeriod": 86400,
+    "Debug.LogCollectorInitialDelay": 5 * 60
 }
 
 
@@ -160,8 +220,45 @@ def get_configuration(conf=__conf__):
     return options
 
 
+def get_default_value(option):
+    if option in __STRING_OPTIONS__:
+        return __STRING_OPTIONS__[option]
+    raise ValueError("{0} is not a valid configuration parameter.".format(option))
+
+
+def get_int_default_value(option):
+    if option in __INTEGER_OPTIONS__:
+        return int(__INTEGER_OPTIONS__[option])
+    raise ValueError("{0} is not a valid configuration parameter.".format(option))
+
+
+def get_switch_default_value(option):
+    if option in __SWITCH_OPTIONS__:
+        return __SWITCH_OPTIONS__[option]
+    raise ValueError("{0} is not a valid configuration parameter.".format(option))
+
+
+def is_present(key, conf=__conf__):
+    """
+    Returns True if the given flag present in the configuration file, False otherwise.
+    """
+    return conf.is_present(key)
+
+
 def enable_firewall(conf=__conf__):
     return conf.get_switch("OS.EnableFirewall", False)
+
+
+def get_enable_firewall_period(conf=__conf__):
+    return conf.get_int("OS.EnableFirewallPeriod", 300)
+
+
+def get_remove_persistent_net_rules_period(conf=__conf__):
+    return conf.get_int("OS.RemovePersistentNetRulesPeriod", 30)
+
+
+def get_monitor_dhcp_client_restart_period(conf=__conf__):
+    return conf.get_int("OS.MonitorDhcpClientRestartPeriod", 30)
 
 
 def enable_rdma(conf=__conf__):
@@ -186,11 +283,20 @@ def get_logs_console(conf=__conf__):
     return conf.get_switch("Logs.Console", True)
 
 
+def get_collect_logs(conf=__conf__):
+    return conf.get_switch("Logs.Collect", True)
+
+
+def get_collect_logs_period(conf=__conf__):
+    return conf.get_int("Logs.CollectPeriod", 3600)
+
+
 def get_lib_dir(conf=__conf__):
     return conf.get("Lib.Dir", "/var/lib/waagent")
 
 
 def get_published_hostname(conf=__conf__):
+    # Some applications rely on this file; do not remove this setting
     return os.path.join(get_lib_dir(conf), 'published_hostname')
 
 
@@ -204,6 +310,10 @@ def get_agent_pid_file_path(conf=__conf__):
 
 def get_ext_log_dir(conf=__conf__):
     return conf.get("Extension.LogDir", "/var/log/azure")
+
+
+def get_agent_log_file():
+    return "/var/log/waagent.log"
 
 
 def get_fips_enabled(conf=__conf__):
@@ -244,16 +354,20 @@ def get_ssh_key_glob(conf=__conf__):
 
 def get_ssh_key_private_path(conf=__conf__):
     return os.path.join(get_ssh_dir(conf),
-        'ssh_host_{0}_key'.format(get_ssh_host_keypair_type(conf)))
+        'ssh_host_{0}_key'.format(get_ssh_host_keypair_type(conf))) 
 
 
 def get_ssh_key_public_path(conf=__conf__):
     return os.path.join(get_ssh_dir(conf),
-        'ssh_host_{0}_key.pub'.format(get_ssh_host_keypair_type(conf)))
+        'ssh_host_{0}_key.pub'.format(get_ssh_host_keypair_type(conf))) 
 
 
 def get_root_device_scsi_timeout(conf=__conf__):
     return conf.get("OS.RootDeviceScsiTimeout", None)
+
+
+def get_root_device_scsi_timeout_period(conf=__conf__):
+    return conf.get_int("OS.RootDeviceScsiTimeoutPeriod", 30)
 
 
 def get_ssh_host_keypair_type(conf=__conf__):
@@ -273,6 +387,22 @@ def get_ssh_host_keypair_mode(conf=__conf__):
 
 def get_extensions_enabled(conf=__conf__):
     return conf.get_switch("Extensions.Enabled", True)
+
+
+def get_wait_for_cloud_init(conf=__conf__):
+    return conf.get_switch("Extensions.WaitForCloudInit", False)
+
+
+def get_wait_for_cloud_init_timeout(conf=__conf__):
+    return conf.get_switch("Extensions.WaitForCloudInitTimeout", 3600)
+
+
+def get_goal_state_period(conf=__conf__):
+    return conf.get_int("Extensions.GoalStatePeriod", 6)
+
+
+def get_initial_goal_state_period(conf=__conf__):
+    return conf.get_int("Extensions.InitialGoalStatePeriod", default_value=lambda: get_goal_state_period(conf=conf))
 
 
 def get_allow_reset_sys_user(conf=__conf__):
@@ -322,6 +452,10 @@ def get_monitor_hostname(conf=__conf__):
     return conf.get_switch("Provisioning.MonitorHostName", False)
 
 
+def get_monitor_hostname_period(conf=__conf__):
+    return conf.get_int("Provisioning.MonitorHostNamePeriod", 30)
+
+
 def get_httpproxy_host(conf=__conf__):
     return conf.get("HttpProxy.Host", None)
 
@@ -340,9 +474,11 @@ def get_resourcedisk_format(conf=__conf__):
 
 def get_resourcedisk_enable_swap(conf=__conf__):
     return conf.get_switch("ResourceDisk.EnableSwap", False)
-    
+
+
 def get_resourcedisk_enable_swap_encryption(conf=__conf__):
     return conf.get_switch("ResourceDisk.EnableSwapEncryption", False)
+
 
 def get_resourcedisk_mountpoint(conf=__conf__):
     return conf.get("ResourceDisk.MountPoint", "/mnt/resource")
@@ -384,10 +520,182 @@ def get_disable_agent_file_path(conf=__conf__):
     return os.path.join(get_lib_dir(conf), DISABLE_AGENT_FILE)
 
 
-def get_cgroups_enforce_limits(conf=__conf__):
-    return conf.get_switch("CGroups.EnforceLimits", False)
+def get_cgroups_enabled(conf=__conf__):
+    return conf.get_switch("CGroups.Enabled", True)
 
 
-def get_cgroups_excluded(conf=__conf__):
-    excluded_value = conf.get("CGroups.Excluded", "customscript, runcommand")
-    return [s for s in [i.strip().lower() for i in excluded_value.split(',')] if len(s) > 0] if excluded_value else []
+def get_monitor_network_configuration_changes(conf=__conf__):
+    return conf.get_switch("Monitor.NetworkConfigurationChanges", False)
+
+
+def get_auto_update_to_latest_version(conf=__conf__):
+    """
+    If set to True, agent will update to the latest version
+    NOTE:
+        when both turned on, both AutoUpdate.Enabled and AutoUpdate.UpdateToLatestVersion same meaning: update to latest version
+        when turned off, AutoUpdate.Enabled: reverts to pre-installed agent, AutoUpdate.UpdateToLatestVersion: uses latest version already installed on the vm and does not download new agents
+        Even we are deprecating AutoUpdate.Enabled, we still need to support if users explicitly setting it instead new flag.
+        If AutoUpdate.UpdateToLatestVersion is present, it overrides any value set for AutoUpdate.Enabled (if present).
+        If AutoUpdate.UpdateToLatestVersion is not present but AutoUpdate.Enabled is present and set to 'n', we adhere to AutoUpdate.Enabled flag's behavior
+        if both not present, we default to True.
+    """
+    default = get_autoupdate_enabled(conf=conf)
+    return conf.get_switch("AutoUpdate.UpdateToLatestVersion", default)
+
+
+def get_cgroup_check_period(conf=__conf__):
+    """
+    How often to perform checks on cgroups (are the processes in the cgroups as expected,
+    has the agent exceeded its quota, etc)
+
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_int("Debug.CgroupCheckPeriod", 300)
+
+
+def get_cgroup_log_metrics(conf=__conf__):
+    """
+    If True, resource usage metrics are written to the local log
+
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_switch("Debug.CgroupLogMetrics", False)
+
+
+def get_cgroup_disable_on_process_check_failure(conf=__conf__):
+    """
+    If True, cgroups will be disabled if the process check fails
+
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_switch("Debug.CgroupDisableOnProcessCheckFailure", True)
+
+
+def get_cgroup_disable_on_quota_check_failure(conf=__conf__):
+    """
+    If True, cgroups will be disabled if the CPU quota check fails
+
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_switch("Debug.CgroupDisableOnQuotaCheckFailure", True)
+
+
+def get_agent_cpu_quota(conf=__conf__):
+    """
+    CPU quota for the agent as a percentage of 1 CPU (100% == 1 CPU)
+
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_int("Debug.AgentCpuQuota", 50)
+
+
+def get_agent_cpu_throttled_time_threshold(conf=__conf__):
+    """
+    Throttled time threshold for agent cpu in seconds.
+
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_int("Debug.AgentCpuThrottledTimeThreshold", 120)
+
+
+def get_agent_memory_quota(conf=__conf__):
+    """
+    Memory quota for the agent in bytes.
+
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_int("Debug.AgentMemoryQuota", 30 * 1024 ** 2)
+
+
+def get_enable_agent_memory_usage_check(conf=__conf__):
+    """
+    If True, Agent checks it's Memory usage.
+
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_switch("Debug.EnableAgentMemoryUsageCheck", False)
+
+
+def get_cgroup_monitor_expiry_time(conf=__conf__):
+    """
+    cgroups monitoring for pilot extensions disabled after expiry time
+
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get("Debug.CgroupMonitorExpiryTime", "2022-03-31")
+
+
+def get_cgroup_monitor_extension_name (conf=__conf__):
+    """
+    cgroups monitoring extension name
+
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get("Debug.CgroupMonitorExtensionName", "Microsoft.Azure.Monitor.AzureMonitorLinuxAgent")
+
+
+def get_enable_fast_track(conf=__conf__):
+    """
+    If True, the agent use FastTrack when retrieving goal states
+
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_switch("Debug.EnableFastTrack", True)
+
+
+def get_etp_collection_period(conf=__conf__):
+    """
+    Determines the frequency to perform ETP collection on extensions telemetry events.
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_int("Debug.EtpCollectionPeriod", 300)
+
+
+def get_self_update_hotfix_frequency(conf=__conf__):
+    """
+    Determines the frequency to check for Hotfix upgrades (<Build> version changed in new upgrades).
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_int("Debug.SelfUpdateHotfixFrequency", 4 * 60 * 60)
+
+
+def get_self_update_regular_frequency(conf=__conf__):
+    """
+    Determines the frequency to check for regular upgrades (<Major>.<Minor>.<patch> version changed in new upgrades).
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_int("Debug.SelfUpdateRegularFrequency", 24 * 60 * 60)
+
+
+def get_enable_ga_versioning(conf=__conf__):
+    """
+    If True, the agent looks for rsm updates(checking requested version in GS) otherwise it will fall back to self-update and finds the highest version from PIR.
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_switch("Debug.EnableGAVersioning", True)
+
+
+def get_firewall_rules_log_period(conf=__conf__):
+    """
+    Determine the frequency to perform the periodic operation of logging firewall rules.
+
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_int("Debug.FirewallRulesLogPeriod", 86400)
+
+
+def get_enable_cgroup_v2_resource_limiting(conf=__conf__):
+    """
+    If True, the agent will enable resource monitoring and enforcement for the log collector on machines using cgroup v2.
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_switch("Debug.EnableCgroupV2ResourceLimiting", False)
+
+
+def get_log_collector_initial_delay(conf=__conf__):
+    """
+    Determine the initial delay at service start before the first periodic log collection.
+
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_int("Debug.LogCollectorInitialDelay", 5 * 60)

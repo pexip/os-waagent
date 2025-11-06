@@ -1,28 +1,25 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache License.
 
-from azurelinuxagent.ga.exthandlers import ExtHandlerInstance
-from azurelinuxagent.common.protocol.restapi import ExtHandler, ExtHandlerProperties, ExtHandlerPackage, \
-    ExtHandlerVersionUri
 import os
 import shutil
 import sys
-from tests.tools import AgentTestCase, patch
+
+from azurelinuxagent.common.protocol.restapi import Extension, ExtHandlerPackage
+from azurelinuxagent.ga.exthandlers import ExtHandlerInstance
+from tests.lib.tools import AgentTestCase, patch
 
 
 class ExtHandlerInstanceTestCase(AgentTestCase):
     def setUp(self):
         AgentTestCase.setUp(self)
 
-        ext_handler_properties = ExtHandlerProperties()
-        ext_handler_properties.version = "1.2.3"
-        ext_handler = ExtHandler(name='foo')
-        ext_handler.properties = ext_handler_properties
+        ext_handler = Extension(name='foo')
+        ext_handler.version = "1.2.3"
         self.ext_handler_instance = ExtHandlerInstance(ext_handler=ext_handler, protocol=None)
 
-        pkg_uri = ExtHandlerVersionUri()
-        pkg_uri.uri = "http://bar/foo__1.2.3"
-        self.ext_handler_instance.pkg = ExtHandlerPackage(ext_handler_properties.version)
+        pkg_uri = "http://bar/foo__1.2.3"
+        self.ext_handler_instance.pkg = ExtHandlerPackage(ext_handler.version)
         self.ext_handler_instance.pkg.uris.append(pkg_uri)
 
         self.base_dir = self.tmp_dir
@@ -32,6 +29,7 @@ class ExtHandlerInstanceTestCase(AgentTestCase):
 
     def tearDown(self):
         self.mock_get_base_dir.stop()
+        super(ExtHandlerInstanceTestCase, self).tearDown()
 
     def test_rm_ext_handler_dir_should_remove_the_extension_packages(self):
         os.mkdir(self.extension_directory)
@@ -117,15 +115,15 @@ class ExtHandlerInstanceTestCase(AgentTestCase):
 
         original_remove_api = getattr(shutil.os, remove_api_name)
 
-        def mock_remove(path, dir_fd=None):
+        def mock_remove(path, dir_fd=None):  # pylint: disable=unused-argument
             if path.endswith("extension_file2"):
-                raise IOError("A mocked error")
+                raise IOError(999,"A mocked error","extension_file2")
             original_remove_api(path)
 
         with patch.object(shutil.os, remove_api_name, mock_remove):
             with patch.object(self.ext_handler_instance, "report_event") as mock_report_event:
                 self.ext_handler_instance.remove_ext_handler()
 
-        args, kwargs = mock_report_event.call_args
+        args, kwargs = mock_report_event.call_args  # pylint: disable=unused-variable
         self.assertTrue("A mocked error" in kwargs["message"])
 

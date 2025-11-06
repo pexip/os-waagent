@@ -1,3 +1,4 @@
+1
 # See https://help.github.com/articles/about-codeowners/
 # for more info about CODEOWNERS file
 
@@ -9,6 +10,7 @@
 # when there are requests for changes in the provisioning agent. For any
 # questions, please feel free to reach out to thstring@microsoft.com.
 /azurelinuxagent/pa/ @trstringer @anhvoms
+/tests/pa/ @trstringer @anhvoms
 
 #
 # RDMA
@@ -19,4 +21,4 @@
 #
 # Linux Agent team
 #
-* @narrieta @vrdmr @pgombar @larohra
+* @narrieta @ZhidongPeng @nagworld9 @maddieford @gabstamsft

@@ -17,26 +17,29 @@
 
 
 import azurelinuxagent.common.logger as logger
-from azurelinuxagent.common.version import *
-from .default import DefaultOSUtil
+from azurelinuxagent.common.version import DISTRO_NAME, DISTRO_CODE_NAME, DISTRO_VERSION, DISTRO_FULL_NAME
+from azurelinuxagent.common.utils.distro_version import DistroVersion
+from .alpine import AlpineOSUtil
 from .arch import ArchUtil
+from .bigip import BigIpOSUtil
 from .clearlinux import ClearLinuxUtil
 from .coreos import CoreOSUtil
 from .debian import DebianOSBaseUtil, DebianOSModernUtil
+from .default import DefaultOSUtil
+from .devuan import DevuanOSUtil
 from .freebsd import FreeBSDOSUtil
-from .openbsd import OpenBSDOSUtil
-from .redhat import RedhatOSUtil, Redhat6xOSUtil
-from .suse import SUSEOSUtil, SUSE11OSUtil
-from .ubuntu import UbuntuOSUtil, Ubuntu12OSUtil, Ubuntu14OSUtil, \
-    UbuntuSnappyOSUtil, Ubuntu16OSUtil, Ubuntu18OSUtil
-from .alpine import AlpineOSUtil
-from .bigip import BigIpOSUtil
 from .gaia import GaiaOSUtil
 from .iosxe import IosxeOSUtil
+from .mariner import MarinerOSUtil
 from .nsbsd import NSBSDOSUtil
+from .openbsd import OpenBSDOSUtil
 from .openwrt import OpenWRTOSUtil
-
-from distutils.version import LooseVersion as Version
+from .redhat import RedhatOSUtil, Redhat6xOSUtil, RedhatOSModernUtil
+from .suse import SUSEOSUtil, SUSE11OSUtil
+from .photonos import PhotonOSUtil
+from .ubuntu import UbuntuOSUtil, Ubuntu12OSUtil, Ubuntu14OSUtil, \
+    UbuntuSnappyOSUtil, Ubuntu16OSUtil, Ubuntu18OSUtil
+from .fedora import FedoraOSUtil
 
 
 def get_osutil(distro_name=DISTRO_NAME,
@@ -52,6 +55,9 @@ def get_osutil(distro_name=DISTRO_NAME,
 
 def _get_osutil(distro_name, distro_code_name, distro_version, distro_full_name):
 
+    if distro_name == "photonos":
+        return PhotonOSUtil()
+
     if distro_name == "arch":
         return ArchUtil()
 
@@ -59,18 +65,19 @@ def _get_osutil(distro_name, distro_code_name, distro_version, distro_full_name)
         return ClearLinuxUtil()
 
     if distro_name == "ubuntu":
-        if Version(distro_version) in [Version("12.04"), Version("12.10")]:
+        ubuntu_version = DistroVersion(distro_version)
+        if ubuntu_version in [DistroVersion("12.04"), DistroVersion("12.10")]:
             return Ubuntu12OSUtil()
-        elif Version(distro_version) in [Version("14.04"), Version("14.10")]:
+        if ubuntu_version in [DistroVersion("14.04"), DistroVersion("14.10")]:
             return Ubuntu14OSUtil()
-        elif Version(distro_version) in [Version('16.04'), Version('16.10'), Version('17.04')]:
+        if ubuntu_version in [DistroVersion('16.04'), DistroVersion('16.10'), DistroVersion('17.04')]:
             return Ubuntu16OSUtil()
-        elif Version(distro_version) in [Version('18.04')]:
+        if DistroVersion('18.04') <= ubuntu_version <= DistroVersion('24.04'):
             return Ubuntu18OSUtil()
-        elif distro_full_name == "Snappy Ubuntu Core":
+        if distro_full_name == "Snappy Ubuntu Core":
             return UbuntuSnappyOSUtil()
-        else:
-            return UbuntuOSUtil()
+
+        return UbuntuOSUtil()
 
     if distro_name == "alpine":
         return AlpineOSUtil()
@@ -78,32 +85,46 @@ def _get_osutil(distro_name, distro_code_name, distro_version, distro_full_name)
     if distro_name == "kali":
         return DebianOSBaseUtil()
 
-    if distro_name == "coreos" or distro_code_name == "coreos":
+    if distro_name in ("flatcar", "coreos") or distro_code_name in ("flatcar", "coreos"):
         return CoreOSUtil()
 
-    if distro_name in ("suse", "sles", "opensuse"):
+    if distro_name in ("suse", "sle-micro", "sle_hpc", "sles", "opensuse"):
         if distro_full_name == 'SUSE Linux Enterprise Server' \
-                and Version(distro_version) < Version('12') \
-                or distro_full_name == 'openSUSE' and Version(distro_version) < Version('13.2'):
+                and DistroVersion(distro_version) < DistroVersion('12') \
+                or distro_full_name == 'openSUSE' and DistroVersion(distro_version) < DistroVersion('13.2'):
             return SUSE11OSUtil()
-        else:
-            return SUSEOSUtil()
+
+        return SUSEOSUtil()
 
     if distro_name == "debian":
-        if "sid" in distro_version or Version(distro_version) > Version("7"):
+        if "sid" in distro_version or DistroVersion(distro_version) > DistroVersion("7"):
             return DebianOSModernUtil()
-        else:
-            return DebianOSBaseUtil()
 
-    if distro_name == "redhat" \
-            or distro_name == "centos" \
-            or distro_name == "oracle":
-        if Version(distro_version) < Version("7"):
+        return DebianOSBaseUtil()
+
+    # Devuan support only works with v4+ 
+    # Reason is that Devuan v4 (Chimaera) uses python v3.9, in which the 
+    # platform.linux_distribution module has been removed. This was unable
+    # to distinguish between debian and devuan. The new distro.linux_distribution module
+    # is able to distinguish between the two.
+
+    if distro_name == "devuan" and DistroVersion(distro_version) >= DistroVersion("4"):
+        return DevuanOSUtil()
+        
+    if distro_name in ("redhat", "rhel", "centos", "oracle", "almalinux",
+                       "cloudlinux", "rocky"):
+        if DistroVersion(distro_version) < DistroVersion("7"):
             return Redhat6xOSUtil()
-        else:
-            return RedhatOSUtil()
+
+        if DistroVersion(distro_version) >= DistroVersion("8.6"):
+            return RedhatOSModernUtil()
+
+        return RedhatOSUtil()
 
     if distro_name == "euleros":
+        return RedhatOSUtil()
+
+    if distro_name == "uos":
         return RedhatOSUtil()
 
     if distro_name == "freebsd":
@@ -121,14 +142,17 @@ def _get_osutil(distro_name, distro_code_name, distro_version, distro_full_name)
     if distro_name == "iosxe":
         return IosxeOSUtil()
 
+    if distro_name in ["mariner", "azurelinux"]:
+        return MarinerOSUtil()
+
     if distro_name == "nsbsd":
         return NSBSDOSUtil()
 
     if distro_name == "openwrt":
         return OpenWRTOSUtil()
 
-    else:
-        logger.warn("Unable to load distro implementation for {0}. Using "
-                    "default distro implementation instead.",
-                    distro_name)
-        return DefaultOSUtil()
+    if distro_name == "fedora":
+        return FedoraOSUtil()
+
+    logger.warn("Unable to load distro implementation for {0}. Using default distro implementation instead.", distro_name)
+    return DefaultOSUtil()
