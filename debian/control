@@ -1,4 +1,4 @@
-Source: walinuxagent
+Source: waagent
 Section: admin
 Priority: optional
 Maintainer: Pexip AS <packaging@pexip.com>
@@ -15,7 +15,7 @@ Homepage: https://github.com/Azure/WALinuxAgent
 Vcs-Browser: https://salsa.debian.org/waldi/waagent
 Vcs-Git: https://salsa.debian.org/waldi/waagent.git
 
-Package: walinuxagent
+Package: waagent
 Architecture: all
 Depends:
  ${misc:Depends}, ${python3:Depends},
