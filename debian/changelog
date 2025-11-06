@@ -1,3 +1,9 @@
+waagent (2.12.0.2-3+pexip25u1) pexip-trixie; urgency=medium
+
+  * Re-sync with upstream debian
+
+ -- Huw Jones <huw@pexip.com>  Thu, 06 Nov 2025 16:27:04 0000
+
 waagent (2.12.0.2-3) unstable; urgency=medium
 
   * Add python3-crypt-r to runtime dependencies, not just build-deps
