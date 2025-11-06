@@ -17,10 +17,9 @@
 
 import os.path
 
-from azurelinuxagent.common.conf import *
 import azurelinuxagent.common.conf as conf
-
-from tests.tools import AgentTestCase, data_dir, patch
+from azurelinuxagent.common.utils import fileutil
+from tests.lib.tools import AgentTestCase, data_dir
 
 
 class TestConf(AgentTestCase):
@@ -28,6 +27,8 @@ class TestConf(AgentTestCase):
     # -- These values *MUST* match those from data/test_waagent.conf
     EXPECTED_CONFIGURATION = {
         "Extensions.Enabled": True,
+        "Extensions.WaitForCloudInit": False,
+        "Extensions.WaitForCloudInitTimeout": 3600,
         "Provisioning.Agent": "auto",
         "Provisioning.DeleteRootPassword": True,
         "Provisioning.RegenerateSshHostKeyPair": True,
@@ -64,19 +65,30 @@ class TestConf(AgentTestCase):
         "OS.CheckRdmaDriver": False,
         "AutoUpdate.Enabled": True,
         "AutoUpdate.GAFamily": "Prod",
+        "AutoUpdate.UpdateToLatestVersion": True,
         "EnableOverProvisioning": True,
         "OS.AllowHTTP": False,
-        "OS.EnableFirewall": False,
-        "CGroups.EnforceLimits": False,
-        "CGroups.Excluded": "customscript,runcommand",
+        "OS.EnableFirewall": False
     }
 
     def setUp(self):
         AgentTestCase.setUp(self)
-        self.conf = ConfigurationProvider()
-        load_conf_from_file(
+        self.conf = conf.ConfigurationProvider()
+        conf.load_conf_from_file(
                 os.path.join(data_dir, "test_waagent.conf"),
                 self.conf)
+
+    def test_get_should_return_default_when_key_is_not_found(self):
+        self.assertEqual("The Default Value", self.conf.get("this-key-does-not-exist", "The Default Value"))
+        self.assertEqual("The Default Value", self.conf.get("this-key-does-not-exist", lambda: "The Default Value"))
+
+    def test_get_switch_should_return_default_when_key_is_not_found(self):
+        self.assertEqual(True, self.conf.get_switch("this-key-does-not-exist", True))
+        self.assertEqual(True, self.conf.get_switch("this-key-does-not-exist", lambda: True))
+
+    def test_get_int_should_return_default_when_key_is_not_found(self):
+        self.assertEqual(123456789, self.conf.get_int("this-key-does-not-exist", 123456789))
+        self.assertEqual(123456789, self.conf.get_int("this-key-does-not-exist", lambda: 123456789))
 
     def test_key_value_handling(self):
         self.assertEqual("Value1", self.conf.get("FauxKey1", "Bad"))
@@ -84,29 +96,29 @@ class TestConf(AgentTestCase):
         self.assertEqual("delalloc,rw,noatime,nobarrier,users,mode=777", self.conf.get("FauxKey3", "Bad"))
 
     def test_get_ssh_dir(self):
-        self.assertTrue(get_ssh_dir(self.conf).startswith("/notareal/path"))
+        self.assertTrue(conf.get_ssh_dir(self.conf).startswith("/notareal/path"))
 
     def test_get_sshd_conf_file_path(self):
-        self.assertTrue(get_sshd_conf_file_path(
+        self.assertTrue(conf.get_sshd_conf_file_path(
             self.conf).startswith("/notareal/path"))
 
     def test_get_ssh_key_glob(self):
-        self.assertTrue(get_ssh_key_glob(
+        self.assertTrue(conf.get_ssh_key_glob(
             self.conf).startswith("/notareal/path"))
 
     def test_get_ssh_key_private_path(self):
-        self.assertTrue(get_ssh_key_private_path(
+        self.assertTrue(conf.get_ssh_key_private_path(
             self.conf).startswith("/notareal/path"))
 
     def test_get_ssh_key_public_path(self):
-        self.assertTrue(get_ssh_key_public_path(
+        self.assertTrue(conf.get_ssh_key_public_path(
             self.conf).startswith("/notareal/path"))
 
     def test_get_fips_enabled(self):
-        self.assertTrue(get_fips_enabled(self.conf))
+        self.assertTrue(conf.get_fips_enabled(self.conf))
 
     def test_get_provision_agent(self):
-        self.assertTrue(get_provisioning_agent(self.conf) == 'auto')
+        self.assertTrue(conf.get_provisioning_agent(self.conf) == 'auto')
 
     def test_get_configuration(self):
         configuration = conf.get_configuration(self.conf)
@@ -118,8 +130,8 @@ class TestConf(AgentTestCase):
                 k)
 
     def test_get_agent_disabled_file_path(self):
-        self.assertEqual(get_disable_agent_file_path(self.conf),
-                         os.path.join(self.tmp_dir, DISABLE_AGENT_FILE))
+        self.assertEqual(conf.get_disable_agent_file_path(self.conf),
+                         os.path.join(self.tmp_dir, conf.DISABLE_AGENT_FILE))
 
     def test_write_agent_disabled(self):
         """
@@ -127,45 +139,64 @@ class TestConf(AgentTestCase):
         """
         from azurelinuxagent.pa.provision.default import ProvisionHandler
 
-        disable_file_path = get_disable_agent_file_path(self.conf)
+        disable_file_path = conf.get_disable_agent_file_path(self.conf)
         self.assertFalse(os.path.exists(disable_file_path))
         ProvisionHandler.write_agent_disabled()
         self.assertTrue(os.path.exists(disable_file_path))
         self.assertEqual('', fileutil.read_file(disable_file_path))
 
     def test_get_extensions_enabled(self):
-        self.assertTrue(get_extensions_enabled(self.conf))
+        self.assertTrue(conf.get_extensions_enabled(self.conf))
 
-    @patch('azurelinuxagent.common.conf.ConfigurationProvider.get')
-    def assert_get_cgroups_excluded(self, patch_get, config, expected_value):
-        patch_get.return_value = config
-        self.assertEqual(expected_value, conf.get_cgroups_excluded(self.conf))
+    def test_get_get_auto_update_to_latest_version(self):
+        # update flags not set
+        self.assertTrue(conf.get_auto_update_to_latest_version(self.conf))
 
-    def test_get_cgroups_excluded(self):
-        self.assert_get_cgroups_excluded(config=None,
-                                         expected_value=[])
+        config = conf.ConfigurationProvider()
+        # AutoUpdate.Enabled is set to 'n'
+        conf.load_conf_from_file(
+                os.path.join(data_dir, "config/waagent_auto_update_disabled.conf"),
+                config)
+        self.assertFalse(conf.get_auto_update_to_latest_version(config), "AutoUpdate.UpdateToLatestVersion should be 'n'")
 
-        self.assert_get_cgroups_excluded(config='',
-                                         expected_value=[])
+        # AutoUpdate.Enabled is set to 'y'
+        conf.load_conf_from_file(
+                os.path.join(data_dir, "config/waagent_auto_update_enabled.conf"),
+                config)
+        self.assertTrue(conf.get_auto_update_to_latest_version(config), "AutoUpdate.UpdateToLatestVersion should be 'y'")
 
-        self.assert_get_cgroups_excluded(config='  ',
-                                         expected_value=[])
+        # AutoUpdate.UpdateToLatestVersion is set to 'n'
+        conf.load_conf_from_file(
+                os.path.join(data_dir, "config/waagent_update_to_latest_version_disabled.conf"),
+                config)
+        self.assertFalse(conf.get_auto_update_to_latest_version(config), "AutoUpdate.UpdateToLatestVersion should be 'n'")
 
-        self.assert_get_cgroups_excluded(config='  ,  ,,  ,',
-                                         expected_value=[])
+        # AutoUpdate.UpdateToLatestVersion is set to 'y'
+        conf.load_conf_from_file(
+                os.path.join(data_dir, "config/waagent_update_to_latest_version_enabled.conf"),
+                config)
+        self.assertTrue(conf.get_auto_update_to_latest_version(config), "AutoUpdate.UpdateToLatestVersion should be 'y'")
 
-        standard_values = ['customscript', 'runcommand']
-        self.assert_get_cgroups_excluded(config='CustomScript, RunCommand',
-                                         expected_value=standard_values)
+        # AutoUpdate.Enabled is set to 'y' and AutoUpdate.UpdateToLatestVersion is set to 'n'
+        conf.load_conf_from_file(
+                os.path.join(data_dir, "config/waagent_auto_update_enabled_update_to_latest_version_disabled.conf"),
+                config)
+        self.assertFalse(conf.get_auto_update_to_latest_version(config), "AutoUpdate.UpdateToLatestVersion should be 'n'")
 
-        self.assert_get_cgroups_excluded(config='customScript, runCommand  , , ,,',
-                                         expected_value=standard_values)
+        # AutoUpdate.Enabled is set to 'n' and AutoUpdate.UpdateToLatestVersion is set to 'y'
+        conf.load_conf_from_file(
+                os.path.join(data_dir, "config/waagent_auto_update_disabled_update_to_latest_version_enabled.conf"),
+                config)
+        self.assertTrue(conf.get_auto_update_to_latest_version(config), "AutoUpdate.UpdateToLatestVersion should be 'y'")
 
-        self.assert_get_cgroups_excluded(config='  customscript,runcommand  ',
-                                         expected_value=standard_values)
+        # AutoUpdate.Enabled is set to 'n' and AutoUpdate.UpdateToLatestVersion is set to 'n'
+        conf.load_conf_from_file(
+                os.path.join(data_dir, "config/waagent_auto_update_disabled_update_to_latest_version_disabled.conf"),
+                config)
+        self.assertFalse(conf.get_auto_update_to_latest_version(config), "AutoUpdate.UpdateToLatestVersion should be 'n'")
 
-        self.assert_get_cgroups_excluded(config='customscript,, runcommand',
-                                         expected_value=standard_values)
-
-        self.assert_get_cgroups_excluded(config=',,customscript ,runcommand',
-                                         expected_value=standard_values)
+        # AutoUpdate.Enabled is set to 'y' and AutoUpdate.UpdateToLatestVersion is set to 'y'
+        conf.load_conf_from_file(
+                os.path.join(data_dir, "config/waagent_auto_update_enabled_update_to_latest_version_enabled.conf"),
+                config)
+        self.assertTrue(conf.get_auto_update_to_latest_version(config), "AutoUpdate.UpdateToLatestVersion should be 'y'")

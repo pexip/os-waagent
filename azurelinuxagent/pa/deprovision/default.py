@@ -25,29 +25,39 @@ import sys
 
 import azurelinuxagent.common.conf as conf
 import azurelinuxagent.common.utils.fileutil as fileutil
-import azurelinuxagent.common.utils.shellutil as shellutil
 from azurelinuxagent.common import version
-
+from azurelinuxagent.ga.cgroupconfigurator import _AGENT_DROP_IN_FILE_SLICE, _DROP_IN_FILE_CPU_ACCOUNTING, \
+    _DROP_IN_FILE_CPU_QUOTA, _DROP_IN_FILE_MEMORY_ACCOUNTING, LOGCOLLECTOR_SLICE
 from azurelinuxagent.common.exception import ProtocolError
-from azurelinuxagent.common.osutil import get_osutil
+from azurelinuxagent.common.osutil import get_osutil, systemd
+from azurelinuxagent.ga.persist_firewall_rules import PersistFirewallRulesHandler
 from azurelinuxagent.common.protocol.util import get_protocol_util
-from azurelinuxagent.ga.exthandlers import HANDLER_NAME_PATTERN
+from azurelinuxagent.ga.exthandlers import HANDLER_COMPLETE_NAME_PATTERN
 
 
 def read_input(message):
     if sys.version_info[0] >= 3:
         return input(message)
     else:
-        return raw_input(message)
+        # This is not defined in python3, and the linter will thus 
+        # throw an undefined-variable<E0602> error on this line.
+        # Suppress it here.
+        return raw_input(message)  # pylint: disable=E0602
+
 
 class DeprovisionAction(object):
-    def __init__(self, func, args=[], kwargs={}):
+    def __init__(self, func, args=None, kwargs=None):
+        if args is None:
+            args = []
+        if kwargs is None:
+            kwargs = {}
         self.func = func
         self.args = args
         self.kwargs = kwargs
 
     def invoke(self):
         self.func(*self.args, **self.kwargs)
+
 
 class DeprovisionHandler(object):
     def __init__(self):
@@ -77,7 +87,6 @@ class DeprovisionHandler(object):
         actions.append(DeprovisionAction(self.osutil.del_account, 
                                          [username]))
 
-
     def regen_ssh_host_key(self, warnings, actions):
         warnings.append("WARNING! All SSH host key pairs will be deleted.")
         actions.append(DeprovisionAction(fileutil.rm_files,
@@ -87,12 +96,12 @@ class DeprovisionHandler(object):
         warnings.append("WARNING! The waagent service will be stopped.")
         actions.append(DeprovisionAction(self.osutil.stop_agent_service))
 
-    def del_dirs(self, warnings, actions):
+    def del_dirs(self, warnings, actions):  # pylint: disable=W0613
         dirs = [conf.get_lib_dir(), conf.get_ext_log_dir()]
         actions.append(DeprovisionAction(fileutil.rm_dirs, dirs))
 
-    def del_files(self, warnings, actions):
-        files = ['/root/.bash_history', '/var/log/waagent.log']
+    def del_files(self, warnings, actions):  # pylint: disable=W0613
+        files = ['/root/.bash_history', conf.get_agent_log_file()]
         actions.append(DeprovisionAction(fileutil.rm_files, files))
 
         # For OpenBSD
@@ -122,10 +131,14 @@ class DeprovisionHandler(object):
         actions.append(DeprovisionAction(fileutil.rm_files,
                                          ["/var/lib/NetworkManager/dhclient-*.lease"]))
 
-    def del_ext_handler_files(self, warnings, actions):
+        # For Ubuntu >= 18.04, using systemd-networkd
+        actions.append(DeprovisionAction(fileutil.rm_files,
+                                         ["/run/systemd/netif/leases/*"]))
+
+    def del_ext_handler_files(self, warnings, actions):  # pylint: disable=W0613
         ext_dirs = [d for d in os.listdir(conf.get_lib_dir())
                     if os.path.isdir(os.path.join(conf.get_lib_dir(), d))
-                    and re.match(HANDLER_NAME_PATTERN, d) is not None
+                    and re.match(HANDLER_COMPLETE_NAME_PATTERN, d) is not None
                     and not version.is_agent_path(d)]
 
         for ext_dir in ext_dirs:
@@ -138,14 +151,19 @@ class DeprovisionHandler(object):
             if len(files) > 0:
                 actions.append(DeprovisionAction(fileutil.rm_files, files))
 
-    def del_lib_dir_files(self, warnings, actions):
+    def del_lib_dir_files(self, warnings, actions):  # pylint: disable=W0613
         known_files = [
             'HostingEnvironmentConfig.xml',
             'Incarnation',
             'partition',
             'Protocol',
             'SharedConfig.xml',
-            'WireServerEndpoint'
+            'WireServerEndpoint',
+            'published_hostname',
+            'fast_track.json',
+            'initial_goal_state',
+            'waagent_rsm_update',
+            'waagent_initial_update'
         ]
         known_files_glob = [
             'Extensions.*.xml',
@@ -163,7 +181,7 @@ class DeprovisionHandler(object):
         if len(files) > 0:
             actions.append(DeprovisionAction(fileutil.rm_files, files))
 
-    def reset_hostname(self, warnings, actions):
+    def reset_hostname(self, warnings, actions):  # pylint: disable=W0613
         localhost = ["localhost.localdomain"]
         actions.append(DeprovisionAction(self.osutil.set_hostname, 
                                          localhost))
@@ -191,6 +209,9 @@ class DeprovisionHandler(object):
         if deluser:
             self.del_user(warnings, actions)
 
+        self.del_persist_firewall_rules(actions)
+        self.remove_agent_cgroup_config(actions)
+
         return warnings, actions
 
     def setup_changed_unique_id(self):
@@ -200,6 +221,8 @@ class DeprovisionHandler(object):
         self.del_dhcp_lease(warnings, actions)
         self.del_lib_dir_files(warnings, actions)
         self.del_ext_handler_files(warnings, actions)
+        self.del_persist_firewall_rules(actions)
+        self.remove_agent_cgroup_config(actions)
 
         return warnings, actions
 
@@ -217,7 +240,7 @@ class DeprovisionHandler(object):
 
         While users *should* manually deprovision a VM, the files removed by
         this routine will help keep the agent from getting confused
-        (since incarnation and extension settings, among other items, will 
+        (since incarnation and extension settings, among other items, will
         no longer be monotonically increasing).
         '''
         warnings, actions = self.setup_changed_unique_id()
@@ -242,10 +265,34 @@ class DeprovisionHandler(object):
         for warning in warnings:
             print(warning)
 
-    def handle_interrupt_signal(self, signum, frame):
+    def handle_interrupt_signal(self, signum, frame):  # pylint: disable=W0613
         if not self.actions_running:
             print("Deprovision is interrupted.")
             sys.exit(0)
 
         print ('Deprovisioning may not be interrupted.')
         return
+
+    @staticmethod
+    def del_persist_firewall_rules(actions):
+        agent_network_service_path = PersistFirewallRulesHandler.get_service_file_path()
+        actions.append(DeprovisionAction(fileutil.rm_files,
+                                         [agent_network_service_path, os.path.join(conf.get_lib_dir(),
+                                          PersistFirewallRulesHandler.BINARY_FILE_NAME)]))
+
+    @staticmethod
+    def remove_agent_cgroup_config(actions):
+        # Get all service drop in file paths
+        agent_drop_in_path = systemd.get_agent_drop_in_path()
+        slice_path = os.path.join(agent_drop_in_path, _AGENT_DROP_IN_FILE_SLICE)
+        cpu_accounting_path = os.path.join(agent_drop_in_path, _DROP_IN_FILE_CPU_ACCOUNTING)
+        cpu_quota_path = os.path.join(agent_drop_in_path, _DROP_IN_FILE_CPU_QUOTA)
+        mem_accounting_path = os.path.join(agent_drop_in_path, _DROP_IN_FILE_MEMORY_ACCOUNTING)
+
+        # Get log collector slice
+        unit_file_install_path = systemd.get_unit_file_install_path()
+        log_collector_slice_path = os.path.join(unit_file_install_path, LOGCOLLECTOR_SLICE)
+
+        actions.append(DeprovisionAction(fileutil.rm_files,
+                                         [slice_path, cpu_accounting_path, cpu_quota_path, mem_accounting_path,
+                                          log_collector_slice_path]))

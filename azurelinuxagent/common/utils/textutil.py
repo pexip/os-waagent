@@ -17,15 +17,15 @@
 # Requires Python 2.6+ and Openssl 1.0+
 
 import base64
-import crypt
 import hashlib
-import random
 import re
-import string
 import struct
 import sys
-import zlib
+import traceback
 import xml.dom.minidom as minidom
+import zlib
+
+from azurelinuxagent.common.future import ustr
 
 
 def parse_doc(xml_text):
@@ -93,12 +93,12 @@ def getattrib(node, attr_name):
         return None
 
 
-def unpack(buf, offset, range):
+def unpack(buf, offset, value_range):
     """
     Unpack bytes into python values.
     """
     result = 0
-    for i in range:
+    for i in value_range:
         result = (result << 8) | str_to_ord(buf[offset + i])
     return result
 
@@ -133,9 +133,9 @@ def hex_dump2(buf):
 
 def is_in_range(a, low, high):
     """
-    Return True if 'a' in 'low' <= a >= 'high'
+    Return True if 'a' in 'low' <= a <= 'high'
     """
-    return (a >= low and a <= high)
+    return low <= a <= high
 
 
 def is_printable(ch):
@@ -147,7 +147,7 @@ def is_printable(ch):
             or is_in_range(ch, str_to_ord('0'), str_to_ord('9')))
 
 
-def hex_dump(buffer, size):
+def hex_dump(buffer, size):  # pylint: disable=redefined-builtin
     """
     Return Hex formated dump of a 'buffer' of 'size'.
     """
@@ -284,16 +284,6 @@ def remove_bom(c):
     return c
 
 
-def gen_password_hash(password, crypt_id, salt_len):
-    collection = string.ascii_letters + string.digits
-    salt = ''.join(random.choice(collection) for _ in range(salt_len))
-    salt = "${0}${1}".format(crypt_id, salt)
-    if sys.version_info[0] == 2:
-        # if python 2.*, encode to type 'str' to prevent Unicode Encode Error from crypt.crypt
-        password = password.encode('utf-8')
-    return crypt.crypt(password, salt)
-
-
 def get_bytes_from_pem(pem_str):
     base64_bytes = ""
     for line in pem_str.split('\n'):
@@ -345,10 +335,10 @@ def swap_hexstring(s, width=2):
         s = ('0' * (width - (len(s) % width))) + s
 
     return ''.join(reversed(
-                        re.findall(
-                                r'[a-f0-9]{{{0}}}'.format(width),
-                                s,
-                                re.IGNORECASE)))
+                        re.findall( 
+                                r'[a-f0-9]{{{0}}}'.format(width), 
+                                s, 
+                                re.IGNORECASE))) 
 
 
 def parse_json(json_str):
@@ -396,3 +386,53 @@ def format_memory_value(unit, value):
         raise TypeError('Value must be convertible to a float')
 
     return int(value * units[unit])
+
+
+def str_to_encoded_ustr(s, encoding='utf-8'):
+    """
+    This function takes the string and converts it into the corresponding encoded ustr if its not already a ustr.
+    The encoding is utf-8 by default if not specified.
+    Note: ustr() is a unicode object for Py2 and a str object for Py3.
+    :param s: The string to convert to ustr
+    :param encoding: Encoding to use. Utf-8 by default
+    :return: Returns the corresponding ustr string. Returns None if input is None.
+    """
+
+    # TODO: Import at the top of the file instead of a local import (using local import here to avoid cyclic dependency)
+    from azurelinuxagent.common.version import PY_VERSION_MAJOR
+
+    if s is None or type(s) is ustr:
+        # If its already a ustr/None then return as is
+        return s
+    if PY_VERSION_MAJOR > 2:
+        try:
+            # For py3+, str() is unicode by default
+            if isinstance(s, bytes):
+                # str.encode() returns bytes which should be decoded to get the str.
+                return s.decode(encoding)
+            else:
+                # If its not encoded, just return the string
+                return ustr(s)
+        except Exception:
+            # If some issues in decoding, just return the string
+            return ustr(s)
+    # For Py2, explicitly convert the string to unicode with the specified encoding
+    return ustr(s, encoding=encoding)
+
+
+def format_exception(exception):
+    # Function to format exception message
+    e = None
+    if sys.version_info[0] == 2:
+        _, e, tb = sys.exc_info()
+    else:
+        tb = exception.__traceback__
+
+    msg = ustr(exception) + "\n"
+    if tb is None or (sys.version_info[0] == 2 and e != exception):
+        msg += "[Traceback not available]"
+    else:
+        msg += ''.join(traceback.format_exception(type(exception), value=exception, tb=tb))
+
+    return msg
+

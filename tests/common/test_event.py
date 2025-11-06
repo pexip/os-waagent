@@ -1,3 +1,4 @@
+# coding=utf-8
 #
 # Copyright 2017 Microsoft Corporation
 #
@@ -17,111 +18,167 @@
 #
 from __future__ import print_function
 
+import json
 import os
+import platform
 import re
 import shutil
 import threading
+import xml.dom
 from datetime import datetime, timedelta
 
+from mock import MagicMock
+
+from azurelinuxagent.common.utils import textutil, fileutil
 from azurelinuxagent.common import event, logger
-from azurelinuxagent.common.event import add_event, add_periodic, add_log_event, elapsed_milliseconds, report_metric, \
-    WALAEventOperation, parse_xml_event, parse_json_event, AGENT_EVENT_FILE_EXTENSION, EVENTS_DIRECTORY
+from azurelinuxagent.common.AgentGlobals import AgentGlobals
+from azurelinuxagent.common.event import add_event, add_periodic, add_log_event, elapsed_milliseconds, \
+    WALAEventOperation, parse_xml_event, parse_json_event, AGENT_EVENT_FILE_EXTENSION, EVENTS_DIRECTORY, \
+    TELEMETRY_EVENT_EVENT_ID, TELEMETRY_EVENT_PROVIDER_ID, TELEMETRY_LOG_EVENT_ID, TELEMETRY_LOG_PROVIDER_ID, \
+    report_metric
 from azurelinuxagent.common.future import ustr
-from azurelinuxagent.common.protocol.goal_state import GoalState
-from tests.protocol import mockwiredata
-from tests.protocol.mocks import mock_wire_protocol
-from azurelinuxagent.common.version import CURRENT_AGENT, CURRENT_VERSION, AGENT_EXECUTION_MODE
 from azurelinuxagent.common.osutil import get_osutil
-from tests.tools import AgentTestCase, data_dir, load_data, Mock, patch, skip_if_predicate_true
-from tests.utils.event_logger_tools import EventLoggerTools
+from azurelinuxagent.common.telemetryevent import CommonTelemetryEventSchema, GuestAgentGenericLogsSchema, \
+    GuestAgentExtensionEventsSchema, GuestAgentPerfCounterEventsSchema
+from azurelinuxagent.common.version import CURRENT_AGENT, CURRENT_VERSION, AGENT_EXECUTION_MODE
+from azurelinuxagent.ga.collect_telemetry_events import _CollectAndEnqueueEvents
+from tests.lib import wire_protocol_data
+from tests.lib.mock_wire_protocol import mock_wire_protocol, MockHttpResponse
+from tests.lib.http_request_predicates import HttpRequestPredicates
+from tests.lib.tools import AgentTestCase, data_dir, load_data, patch, skip_if_predicate_true, is_python_version_26_or_34
+from tests.lib.event_logger_tools import EventLoggerTools
 
 
-class TestEvent(AgentTestCase):
+class TestEvent(HttpRequestPredicates, AgentTestCase):
+    # These are the Operation/Category for events produced by the tests below (as opposed by events produced by the agent itself)
+    _Message = "ThisIsATestEventMessage"
+    _Operation = "ThisIsATestEventOperation"
+    _Category = "ThisIsATestMetricCategory"
+
     def setUp(self):
         AgentTestCase.setUp(self)
 
         self.event_dir = os.path.join(self.tmp_dir, EVENTS_DIRECTORY)
         EventLoggerTools.initialize_event_logger(self.event_dir)
-        threading.current_thread().setName("TestEventThread")
+        threading.current_thread().name = "TestEventThread"
         osutil = get_osutil()
 
         self.expected_common_parameters = {
-            # common parameters computed at event creation; the timestamp (stored as the opcode name) is not included here and
-            # is checked separately from these parameters
-            'GAVersion': CURRENT_AGENT,
-            'ContainerId': GoalState.ContainerID,
-            'EventTid': threading.current_thread().ident,
-            'EventPid': os.getpid(),
-            'TaskName': threading.current_thread().getName(),
-            'KeywordName': '',
-            'IsInternal': False,
+            # common parameters computed at event creation; the timestamp (stored as the opcode name) is not included
+            # here and is checked separately from these parameters
+            CommonTelemetryEventSchema.GAVersion: CURRENT_AGENT,
+            CommonTelemetryEventSchema.ContainerId: AgentGlobals.get_container_id(),
+            CommonTelemetryEventSchema.EventTid: threading.current_thread().ident,
+            CommonTelemetryEventSchema.EventPid: os.getpid(),
+            CommonTelemetryEventSchema.TaskName: threading.current_thread().name,
+            CommonTelemetryEventSchema.KeywordName: json.dumps({"CpuArchitecture": platform.machine()}),
             # common parameters computed from the OS platform
-            'OSVersion': EventLoggerTools.get_expected_os_version(),
-            'ExecutionMode': AGENT_EXECUTION_MODE,
-            'RAM': int(osutil.get_total_mem()),
-            'Processors': osutil.get_processor_cores(),
+            CommonTelemetryEventSchema.OSVersion: EventLoggerTools.get_expected_os_version(),
+            CommonTelemetryEventSchema.ExecutionMode: AGENT_EXECUTION_MODE,
+            CommonTelemetryEventSchema.RAM: int(osutil.get_total_mem()),
+            CommonTelemetryEventSchema.Processors: osutil.get_processor_cores(),
             # common parameters from the goal state
-            'VMName': 'MachineRole_IN_0',
-            'TenantName': 'db00a7755a5e4e8a8fe4b19bc3b330c3',
-            'RoleName': 'MachineRole',
-            'RoleInstanceName': 'MachineRole_IN_0',
+            CommonTelemetryEventSchema.TenantName: 'db00a7755a5e4e8a8fe4b19bc3b330c3',
+            CommonTelemetryEventSchema.RoleName: 'MachineRole',
+            CommonTelemetryEventSchema.RoleInstanceName: 'b61f93d0-e1ed-40b2-b067-22c243233448.MachineRole_IN_0',
             # common parameters
-            'Location': EventLoggerTools.mock_imds_data['location'],
-            'SubscriptionId': EventLoggerTools.mock_imds_data['subscriptionId'],
-            'ResourceGroupName': EventLoggerTools.mock_imds_data['resourceGroupName'],
-            'VMId': EventLoggerTools.mock_imds_data['vmId'],
-            'ImageOrigin': EventLoggerTools.mock_imds_data['image_origin'],
+            CommonTelemetryEventSchema.Location: EventLoggerTools.mock_imds_data['location'],
+            CommonTelemetryEventSchema.SubscriptionId: EventLoggerTools.mock_imds_data['subscriptionId'],
+            CommonTelemetryEventSchema.ResourceGroupName: EventLoggerTools.mock_imds_data['resourceGroupName'],
+            CommonTelemetryEventSchema.VMId: EventLoggerTools.mock_imds_data['vmId'],
+            CommonTelemetryEventSchema.ImageOrigin: EventLoggerTools.mock_imds_data['image_origin'],
         }
 
-    def test_parse_xml_event(self, *args):
+        self.expected_extension_events_params = {
+            GuestAgentExtensionEventsSchema.IsInternal: False,
+            GuestAgentExtensionEventsSchema.ExtensionType: ""
+        }
+
+    @staticmethod
+    def _report_events(protocol, event_list):
+        def _yield_events():
+            for telemetry_event in event_list:
+                yield telemetry_event
+
+        protocol.client.report_event(_yield_events())
+
+    @staticmethod
+    def _collect_events():
+        def append_event(e):
+            for p in e.parameters:
+                if p.name == 'Operation' and p.value == TestEvent._Operation \
+                    or p.name == 'Category' and p.value == TestEvent._Category \
+                    or p.name == 'Message' and p.value == TestEvent._Message \
+                    or p.name == 'Context1' and p.value == TestEvent._Message:
+                    event_list.append(e)
+        event_list = []
+        send_telemetry_events = MagicMock()
+        send_telemetry_events.enqueue_event = MagicMock(wraps=append_event)
+        event_collector = _CollectAndEnqueueEvents(send_telemetry_events)
+        event_collector.process_events()
+        return event_list
+
+    def _collect_event_files(self):
+        files = [os.path.join(self.event_dir, f) for f in os.listdir(self.event_dir)]
+        return [f for f in files if fileutil.findre_in_file(f, TestEvent._Operation)]
+
+    @staticmethod
+    def _is_guest_extension_event(event):  # pylint: disable=redefined-outer-name
+        return event.eventId == TELEMETRY_EVENT_EVENT_ID and event.providerId == TELEMETRY_EVENT_PROVIDER_ID
+
+    @staticmethod
+    def _is_telemetry_log_event(event):  # pylint: disable=redefined-outer-name
+        return event.eventId == TELEMETRY_LOG_EVENT_ID and event.providerId == TELEMETRY_LOG_PROVIDER_ID
+
+    def test_parse_xml_event(self, *args):  # pylint: disable=unused-argument
         data_str = load_data('ext/event_from_extension.xml')
-        event = parse_xml_event(data_str)
-        self.assertNotEqual(None, event)
+        event = parse_xml_event(data_str)  # pylint: disable=redefined-outer-name
+        self.assertIsNotNone(event)
         self.assertNotEqual(0, event.parameters)
         self.assertTrue(all(param is not None for param in event.parameters))
 
-    def test_parse_json_event(self, *args):
+    def test_parse_json_event(self, *args):  # pylint: disable=unused-argument
         data_str = load_data('ext/event.json')
-        event = parse_json_event(data_str)
-        self.assertNotEqual(None, event)
+        event = parse_json_event(data_str)  # pylint: disable=redefined-outer-name
+        self.assertIsNotNone(event)
         self.assertNotEqual(0, event.parameters)
         self.assertTrue(all(param is not None for param in event.parameters))
 
     def test_add_event_should_use_the_container_id_from_the_most_recent_goal_state(self):
-        def create_event_and_return_container_id():
-            event.add_event(name='Event')
-            event_list = event.collect_events()
-            self.assertEquals(len(event_list.events), 1, "Could not find the event created by add_event")
+        def create_event_and_return_container_id():  # pylint: disable=inconsistent-return-statements
+            event.add_event(name='Event', op=TestEvent._Operation)
+            event_list = self._collect_events()
+            self.assertEqual(len(event_list), 1, "Could not find the event created by add_event")
 
-            for p in event_list.events[0].parameters:
-                if p.name == 'ContainerId':
+            for p in event_list[0].parameters:
+                if p.name == CommonTelemetryEventSchema.ContainerId:
                     return p.value
 
             self.fail("Could not find Contained ID on event")
 
-        with mock_wire_protocol(mockwiredata.DATA_FILE) as protocol:
+        with mock_wire_protocol(wire_protocol_data.DATA_FILE) as protocol:
             contained_id = create_event_and_return_container_id()
             # The expect value comes from DATA_FILE
-            self.assertEquals(contained_id, 'c6d5526c-5ac2-4200-b6e2-56f2b70c5ab2', "Incorrect container ID")
+            self.assertEqual(contained_id, 'c6d5526c-5ac2-4200-b6e2-56f2b70c5ab2', "Incorrect container ID")
 
             protocol.mock_wire_data.set_container_id('AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE')
-            protocol.update_goal_state()
+            protocol.client.update_goal_state()
             contained_id = create_event_and_return_container_id()
-            self.assertEquals(contained_id, 'AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE', "Incorrect container ID")
+            self.assertEqual(contained_id, 'AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE', "Incorrect container ID")
 
             protocol.mock_wire_data.set_container_id('11111111-2222-3333-4444-555555555555')
-            protocol.update_goal_state()
+            protocol.client.update_goal_state()
             contained_id = create_event_and_return_container_id()
-            self.assertEquals(contained_id, '11111111-2222-3333-4444-555555555555', "Incorrect container ID")
+            self.assertEqual(contained_id, '11111111-2222-3333-4444-555555555555', "Incorrect container ID")
 
 
     def test_add_event_should_handle_event_errors(self):
         with patch("azurelinuxagent.common.utils.fileutil.mkdir", side_effect=OSError):
             with patch('azurelinuxagent.common.logger.periodic_error') as mock_logger_periodic_error:
-                add_event('test', message='test event')
+                add_event('test', message='test event', op=TestEvent._Operation)
 
                 # The event shouldn't have been created
-                self.assertTrue(len(os.listdir(self.event_dir)) == 0)
+                self.assertTrue(len(self._collect_event_files()) == 0)
 
                 # The exception should have been caught and logged
                 args = mock_logger_periodic_error.call_args
@@ -219,12 +276,12 @@ class TestEvent(AgentTestCase):
                   message="dummy event message",
                   reporter=mock_reporter)
 
-        self.assertEquals(1, mock_logger_error.call_count)
-        self.assertEquals(1, mock_logger_warn.call_count)
-        self.assertEquals(0, mock_logger_info.call_count)
+        self.assertEqual(1, mock_logger_error.call_count)
+        self.assertEqual(1, mock_logger_warn.call_count)
+        self.assertEqual(0, mock_logger_info.call_count)
 
         args = mock_logger_error.call_args[0]
-        self.assertEquals(('dummy name', 'Download', 'dummy event message', 0), args[1:])
+        self.assertEqual(('dummy name', 'Download', 'dummy event message', 0), args[1:])
 
     @patch('azurelinuxagent.common.event.EventLogger')
     @patch('azurelinuxagent.common.logger.error')
@@ -246,13 +303,13 @@ class TestEvent(AgentTestCase):
                               is_success=False,
                               message="dummy event message")
 
-                    self.assertEquals(1, mock_should_emit_event.call_count)
-                    self.assertEquals(1, mock_logger_error.call_count)
-                    self.assertEquals(0, mock_logger_warn.call_count)
-                    self.assertEquals(0, mock_logger_info.call_count)
+                    self.assertEqual(1, mock_should_emit_event.call_count)
+                    self.assertEqual(1, mock_logger_error.call_count)
+                    self.assertEqual(0, mock_logger_warn.call_count)
+                    self.assertEqual(0, mock_logger_info.call_count)
 
                     args = mock_logger_error.call_args[0]
-                    self.assertEquals(('dummy name', 'Download', 'dummy event message', 0), args[1:])
+                    self.assertEqual(('dummy name', 'Download', 'dummy event message', 0), args[1:])
 
     @patch('azurelinuxagent.common.event.EventLogger.add_event')
     def test_periodic_emits_if_not_previously_sent(self, mock_event):
@@ -307,7 +364,7 @@ class TestEvent(AgentTestCase):
 
     @patch("azurelinuxagent.common.event.datetime")
     @patch('azurelinuxagent.common.event.EventLogger.add_event')
-    def test_periodic_forwards_args_default_values(self, mock_event, mock_datetime):
+    def test_periodic_forwards_args_default_values(self, mock_event, mock_datetime):  # pylint: disable=unused-argument
         event.__event_logger__.reset_periodic()
         event.add_periodic(logger.EVERY_DAY, "FauxEvent", message="FauxEventMessage")
         mock_event.assert_called_once_with("FauxEvent", op=WALAEventOperation.Unknown, is_success=True, duration=0,
@@ -321,22 +378,22 @@ class TestEvent(AgentTestCase):
                                                version=str(CURRENT_VERSION))
 
     def test_collect_events_should_delete_event_files(self):
-        add_event(name='Event1')
-        add_event(name='Event1')
-        add_event(name='Event3')
+        add_event(name='Event1', op=TestEvent._Operation)
+        add_event(name='Event1', op=TestEvent._Operation)
+        add_event(name='Event3', op=TestEvent._Operation)
 
+        event_files = self._collect_event_files()
+        self.assertEqual(3, len(event_files), "Did not find all the event files that were created")
+
+        event_list = self._collect_events()
         event_files = os.listdir(self.event_dir)
-        self.assertEquals(len(event_files), 3, "Did not find all the event files that were created")
 
-        event_list = event.collect_events()
-        event_files = os.listdir(self.event_dir)
-
-        self.assertEquals(len(event_list.events), 3, "Did not collect all the events that were created")
-        self.assertEquals(len(event_files), 0, "The event files were not deleted")
+        self.assertEqual(len(event_list), 3, "Did not collect all the events that were created")
+        self.assertEqual(len(event_files), 0, "The event files were not deleted")
 
     def test_save_event(self):
-        add_event('test', message='test event')
-        self.assertTrue(len(os.listdir(self.event_dir)) == 1)
+        add_event('test', message='test event', op=TestEvent._Operation)
+        self.assertTrue(len(self._collect_event_files()) == 1)
 
         # checking the extension of the file created.
         for filename in os.listdir(self.event_dir):
@@ -346,18 +403,19 @@ class TestEvent(AgentTestCase):
     @staticmethod
     def _get_event_message(evt):
         for p in evt.parameters:
-            if p.name == 'Message':
+            if p.name == GuestAgentExtensionEventsSchema.Message:
                 return p.value
         return None
 
     def test_collect_events_should_be_able_to_process_events_with_non_ascii_characters(self):
         self._create_test_event_file("custom_script_nonascii_characters.tld")
 
-        event_list = event.collect_events()
+        event_list = self._collect_events()
 
-        self.assertEquals(len(event_list.events), 1)
-        self.assertEquals(TestEvent._get_event_message(event_list.events[0]), u'World\u05e2\u05d9\u05d5\u05ea \u05d0\u05d7\u05e8\u05d5\u05ea\u0906\u091c')
+        self.assertEqual(len(event_list), 1)
+        self.assertEqual(TestEvent._get_event_message(event_list[0]), u'World\u05e2\u05d9\u05d5\u05ea \u05d0\u05d7\u05e8\u05d5\u05ea\u0906\u091c')
 
+    @skip_if_predicate_true(is_python_version_26_or_34, "Disabled on Python 2.6 and 3.4, they run on containers where the OS commands needed by the test are not present.")
     def test_collect_events_should_ignore_invalid_event_files(self):
         self._create_test_event_file("custom_script_1.tld")  # a valid event
         self._create_test_event_file("custom_script_utf-16.tld")
@@ -365,26 +423,28 @@ class TestEvent(AgentTestCase):
         os.chmod(self._create_test_event_file("custom_script_no_read_access.tld"), 0o200)
         self._create_test_event_file("custom_script_2.tld")  # another valid event
 
-        with patch("azurelinuxagent.common.event.logger.warn") as mock_warn:
-            event_list = event.collect_events()
+        with patch("azurelinuxagent.common.event.add_event") as mock_add_event:
+            event_list = self._collect_events()
 
-            self.assertEquals(
-                len(event_list.events), 2)
+            self.assertEqual(
+                len(event_list), 2)
             self.assertTrue(
-                all(TestEvent._get_event_message(evt) == "A test telemetry message." for evt in event_list.events),
+                all(TestEvent._get_event_message(evt) == "A test telemetry message." for evt in event_list),
                 "The valid events were not found")
 
-            invalid_events = {}
-            for args in mock_warn.call_args_list:
-                if re.search('Failed to process event file', args[0][0]) is not None:
-                    invalid_events[args[0][1]] = args[0][1]
+            invalid_events = []
+            total_dropped_count = 0
+            for args, kwargs in mock_add_event.call_args_list:  # pylint: disable=unused-variable
+                match = re.search(r"DroppedEventsCount: (\d+)", kwargs['message'])
+                if match is not None:
+                    invalid_events.append(kwargs['op'])
+                    total_dropped_count += int(match.groups()[0])
 
-            def assert_invalid_file_was_reported(file):
-                self.assertIn(file, invalid_events, '{0} was not reported as an invalid event file'.format(file))
-
-            assert_invalid_file_was_reported("custom_script_utf-16.tld")
-            assert_invalid_file_was_reported("custom_script_invalid_json.tld")
-            assert_invalid_file_was_reported("custom_script_no_read_access.tld")
+            self.assertEqual(3, total_dropped_count, "Total dropped events dont match")
+            self.assertIn(WALAEventOperation.CollectEventErrors, invalid_events,
+                          "{0} errors not reported".format(WALAEventOperation.CollectEventErrors))
+            self.assertIn(WALAEventOperation.CollectEventUnicodeErrors, invalid_events,
+                          "{0} errors not reported".format(WALAEventOperation.CollectEventUnicodeErrors))
 
     def test_save_event_rollover(self):
         # We keep 1000 events only, and the older ones are removed.
@@ -428,24 +488,15 @@ class TestEvent(AgentTestCase):
         for i in range(0, 2000):
             evt = os.path.join(self.event_dir, '{0}.tld'.format(ustr(1491004920536531 + i)))
             with open(evt, 'w') as fh:
-                fh.write('test event {0}'.format(i))
+                fh.write('{0}{1}'.format(TestEvent._Operation, i))
+
+        test_events = self._collect_event_files()
+        self.assertTrue(len(test_events) == 2000, "{0} events found, 2000 expected".format(len(test_events)))
+
+        add_event('test', message='last event', op=TestEvent._Operation)
 
         events = os.listdir(self.event_dir)
-        self.assertTrue(len(events) == 2000, "{0} events found, 2000 expected".format(len(events)))
-        add_event('test', message='last event')
-
-        events = os.listdir(self.event_dir)
-        events.sort()
         self.assertTrue(len(events) == 1000, "{0} events found, 1000 expected".format(len(events)))
-        first_event = os.path.join(self.event_dir, events[0])
-        with open(first_event) as first_fh:
-            first_event_text = first_fh.read()
-            self.assertTrue('test event 1001' in first_event_text)
-
-        last_event = os.path.join(self.event_dir, events[-1])
-        with open(last_event) as last_fh:
-            last_event_text = last_fh.read()
-            self.assertTrue('last event' in last_event_text)
 
     def test_elapsed_milliseconds(self):
         utc_start = datetime.utcnow() + timedelta(days=1)
@@ -454,6 +505,8 @@ class TestEvent(AgentTestCase):
     def _assert_event_includes_all_parameters_in_the_telemetry_schema(self, actual_event, expected_parameters, assert_timestamp):
         # add the common parameters to the set of expected parameters
         all_expected_parameters = self.expected_common_parameters.copy()
+        if self._is_guest_extension_event(actual_event):
+            all_expected_parameters.update(self.expected_extension_events_params.copy())
         all_expected_parameters.update(expected_parameters)
 
         # convert the event parameters to a dictionary; do not include the timestamp,
@@ -461,10 +514,16 @@ class TestEvent(AgentTestCase):
         event_parameters = {}
         timestamp = None
         for p in actual_event.parameters:
-            if p.name == 'OpcodeName':  # the timestamp is stored in the opcode name
+            if p.name == CommonTelemetryEventSchema.OpcodeName:  # the timestamp is stored in the opcode name
                 timestamp = p.value
             else:
                 event_parameters[p.name] = p.value
+
+        if self._is_telemetry_log_event(actual_event):
+            # Remove Context2 from event parameters and verify that the timestamp is correct
+            telemetry_log_event_timestamp = event_parameters.pop(GuestAgentGenericLogsSchema.Context2, None)
+            self.assertIsNotNone(telemetry_log_event_timestamp, "Context2 should be filled with a timestamp")
+            assert_timestamp(telemetry_log_event_timestamp)
 
         self.maxDiff = None  # the dictionary diffs can be quite large; display the whole thing
         self.assertDictEqual(event_parameters, all_expected_parameters)
@@ -474,7 +533,7 @@ class TestEvent(AgentTestCase):
 
     @staticmethod
     def _datetime_to_event_timestamp(dt):
-        return dt.strftime(u'%Y-%m-%dT%H:%M:%S.%fZ')
+        return dt.strftime(logger.Logger.LogTimeFormatInUTC)
 
     def _test_create_event_function_should_create_events_that_have_all_the_parameters_in_the_telemetry_schema(self, create_event_function, expected_parameters):
         """
@@ -485,14 +544,13 @@ class TestEvent(AgentTestCase):
         create_event_function()
         timestamp_upper = TestEvent._datetime_to_event_timestamp(datetime.utcnow())
 
-        # retrieve the event that was created
-        event_list = event.collect_events()
+        event_list = self._collect_events()
 
-        self.assertEquals(len(event_list.events), 1)
+        self.assertEqual(len(event_list), 1)
 
         # verify the event parameters
         self._assert_event_includes_all_parameters_in_the_telemetry_schema(
-            event_list.events[0],
+            event_list[0],
             expected_parameters,
             assert_timestamp=lambda timestamp:
                 self.assertTrue(timestamp_lower <= timestamp <= timestamp_upper, "The event timestamp (opcode) is incorrect")
@@ -503,19 +561,19 @@ class TestEvent(AgentTestCase):
             create_event_function=lambda:
                 add_event(
                     name="TestEvent",
-                    op=WALAEventOperation.AgentEnabled,
+                    op=TestEvent._Operation,
                     is_success=True,
                     duration=1234,
                     version="1.2.3.4",
                     message="Test Message"),
             expected_parameters={
-                'Name': 'TestEvent',
-                'Version': '1.2.3.4',
-                'Operation': 'AgentEnabled',
-                'OperationSuccess': True,
-                'Message': 'Test Message',
-                'Duration': 1234,
-                'ExtensionType': ''})
+                GuestAgentExtensionEventsSchema.Name: 'TestEvent',
+                GuestAgentExtensionEventsSchema.Version: '1.2.3.4',
+                GuestAgentExtensionEventsSchema.Operation: TestEvent._Operation,
+                GuestAgentExtensionEventsSchema.OperationSuccess: True,
+                GuestAgentExtensionEventsSchema.Message: 'Test Message',
+                GuestAgentExtensionEventsSchema.Duration: 1234,
+                GuestAgentExtensionEventsSchema.ExtensionType: ''})
 
     def test_add_periodic_should_create_events_that_have_all_the_parameters_in_the_telemetry_schema(self):
         self._test_create_event_function_should_create_events_that_have_all_the_parameters_in_the_telemetry_schema(
@@ -523,41 +581,56 @@ class TestEvent(AgentTestCase):
                 add_periodic(
                     delta=logger.EVERY_MINUTE,
                     name="TestPeriodicEvent",
-                    op=WALAEventOperation.HostPlugin,
+                    op=TestEvent._Operation,
                     is_success=False,
                     duration=4321,
                     version="4.3.2.1",
                     message="Test Periodic Message"),
             expected_parameters={
-                'Name': 'TestPeriodicEvent',
-                'Version': '4.3.2.1',
-                'Operation': 'HostPlugin',
-                'OperationSuccess': False,
-                'Message': 'Test Periodic Message',
-                'Duration': 4321,
-                'ExtensionType': ''})
+                GuestAgentExtensionEventsSchema.Name: 'TestPeriodicEvent',
+                GuestAgentExtensionEventsSchema.Version: '4.3.2.1',
+                GuestAgentExtensionEventsSchema.Operation: TestEvent._Operation,
+                GuestAgentExtensionEventsSchema.OperationSuccess: False,
+                GuestAgentExtensionEventsSchema.Message: 'Test Periodic Message',
+                GuestAgentExtensionEventsSchema.Duration: 4321,
+                GuestAgentExtensionEventsSchema.ExtensionType: ''})
 
     @skip_if_predicate_true(lambda: True, "Enable this test when SEND_LOGS_TO_TELEMETRY is enabled")
     def test_add_log_event_should_create_events_that_have_all_the_parameters_in_the_telemetry_schema(self):
         self._test_create_event_function_should_create_events_that_have_all_the_parameters_in_the_telemetry_schema(
             create_event_function=lambda: add_log_event(logger.LogLevel.INFO, 'A test INFO log event'),
             expected_parameters={
-                'EventName': 'Log',
-                'CapabilityUsed': 'INFO',
-                'Context1': 'A test INFO log event',
-                'Context2': '',
-                'Context3': '',
-                'ExtensionType': ''})
+                GuestAgentGenericLogsSchema.EventName: 'Log',
+                GuestAgentGenericLogsSchema.CapabilityUsed: 'INFO',
+                GuestAgentGenericLogsSchema.Context1: 'log event',
+                GuestAgentGenericLogsSchema.Context3: ''
+            })
+
+    def test_add_log_event_should_always_create_events_when_forced(self):
+        self._test_create_event_function_should_create_events_that_have_all_the_parameters_in_the_telemetry_schema(
+            create_event_function=lambda: add_log_event(logger.LogLevel.WARNING, TestEvent._Message,
+                                                        forced=True),
+            expected_parameters={
+                GuestAgentGenericLogsSchema.EventName: 'Log',
+                GuestAgentGenericLogsSchema.CapabilityUsed: 'WARNING',
+                GuestAgentGenericLogsSchema.Context1: TestEvent._Message,
+                GuestAgentGenericLogsSchema.Context3: ''
+            })
+
+    def test_add_log_event_should_not_create_event_if_not_allowed_and_not_forced(self):
+        add_log_event(logger.LogLevel.WARNING, 'A test WARNING log event')
+        event_list = self._collect_events()
+        self.assertEqual(len(event_list), 0, "No events should be created if not forced and not allowed")
 
     def test_report_metric_should_create_events_that_have_all_the_parameters_in_the_telemetry_schema(self):
         self._test_create_event_function_should_create_events_that_have_all_the_parameters_in_the_telemetry_schema(
-            create_event_function=lambda: report_metric("cpu", "%idle", "total", 12.34),
+            create_event_function=lambda: report_metric(TestEvent._Category, "%idle", "total", 12.34),
             expected_parameters={
-                'Category': 'cpu',
-                'Counter': '%idle',
-                'Instance': 'total',
-                'Value': 12.34,
-                'ExtensionType': ''})
+                GuestAgentPerfCounterEventsSchema.Category: TestEvent._Category,
+                GuestAgentPerfCounterEventsSchema.Counter: '%idle',
+                GuestAgentPerfCounterEventsSchema.Instance: 'total',
+                GuestAgentPerfCounterEventsSchema.Value: 12.34
+            })
 
     def _create_test_event_file(self, source_file):
         source_file_path = os.path.join(data_dir, "events", source_file)
@@ -566,7 +639,7 @@ class TestEvent(AgentTestCase):
         return target_file_path
 
     @staticmethod
-    def _get_file_creation_timestamp(file):
+    def _get_file_creation_timestamp(file):  # pylint: disable=redefined-builtin
         return  TestEvent._datetime_to_event_timestamp(datetime.fromtimestamp(os.path.getmtime(file)))
 
     def test_collect_events_should_add_all_the_parameters_in_the_telemetry_schema_to_legacy_agent_events(self):
@@ -574,29 +647,29 @@ class TestEvent(AgentTestCase):
         # only a subset of fields; the rest are added by the current agent when events are collected.
         self._create_test_event_file("legacy_agent.tld")
 
-        event_list = event.collect_events()
+        event_list = self._collect_events()
 
-        self.assertEquals(len(event_list.events), 1)
+        self.assertEqual(len(event_list), 1)
 
         self._assert_event_includes_all_parameters_in_the_telemetry_schema(
-            event_list.events[0],
+            event_list[0],
             expected_parameters={
-                "Name": "WALinuxAgent",
-                "Version": "9.9.9",
-                "IsInternal": False,
-                "Operation": "InitializeCGroups",
-                "OperationSuccess": True,
-                "Message": "The cgroup filesystem is ready to use",
-                "Duration": 1234,
-                "ExtensionType": "ALegacyExtensionType",
-                "GAVersion": "WALinuxAgent-1.1.1",
-                "ContainerId": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
-                "EventTid": 98765,
-                "EventPid": 4321,
-                "TaskName": "ALegacyTask",
-                "KeywordName": "ALegacyKeywordName"},
+                GuestAgentExtensionEventsSchema.Name: "WALinuxAgent",
+                GuestAgentExtensionEventsSchema.Version: "9.9.9",
+                GuestAgentExtensionEventsSchema.IsInternal: False,
+                GuestAgentExtensionEventsSchema.Operation: TestEvent._Operation,
+                GuestAgentExtensionEventsSchema.OperationSuccess: True,
+                GuestAgentExtensionEventsSchema.Message: "The cgroup filesystem is ready to use",
+                GuestAgentExtensionEventsSchema.Duration: 1234,
+                GuestAgentExtensionEventsSchema.ExtensionType: "ALegacyExtensionType",
+                CommonTelemetryEventSchema.GAVersion: "WALinuxAgent-1.1.1",
+                CommonTelemetryEventSchema.ContainerId: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+                CommonTelemetryEventSchema.EventTid: 98765,
+                CommonTelemetryEventSchema.EventPid: 4321,
+                CommonTelemetryEventSchema.TaskName: "ALegacyTask",
+                CommonTelemetryEventSchema.KeywordName: "ALegacyKeywordName"},
             assert_timestamp=lambda timestamp:
-                self.assertEquals(timestamp, '1970-01-01 12:00:00', "The event timestamp (opcode) is incorrect")
+                self.assertEqual(timestamp, '1970-01-01 12:00:00', "The event timestamp (opcode) is incorrect")
         )
 
     def test_collect_events_should_use_the_file_creation_time_for_legacy_agent_events_missing_a_timestamp(self):
@@ -604,29 +677,29 @@ class TestEvent(AgentTestCase):
 
         event_creation_time = TestEvent._get_file_creation_timestamp(test_file)
 
-        event_list = event.collect_events()
+        event_list = self._collect_events()
 
-        self.assertEquals(len(event_list.events), 1)
+        self.assertEqual(len(event_list), 1)
 
         self._assert_event_includes_all_parameters_in_the_telemetry_schema(
-            event_list.events[0],
+            event_list[0],
             expected_parameters={
-                "Name": "WALinuxAgent",
-                "Version": "9.9.9",
-                "IsInternal": False,
-                "Operation": "InitializeCGroups",
-                "OperationSuccess": True,
-                "Message": "The cgroup filesystem is ready to use",
-                "Duration": 1234,
-                "ExtensionType": "ALegacyExtensionType",
-                "GAVersion": "WALinuxAgent-1.1.1",
-                "ContainerId": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
-                "EventTid": 98765,
-                "EventPid": 4321,
-                "TaskName": "ALegacyTask",
-                "KeywordName": "ALegacyKeywordName"},
+                GuestAgentExtensionEventsSchema.Name: "WALinuxAgent",
+                GuestAgentExtensionEventsSchema.Version: "9.9.9",
+                GuestAgentExtensionEventsSchema.IsInternal: False,
+                GuestAgentExtensionEventsSchema.Operation: TestEvent._Operation,
+                GuestAgentExtensionEventsSchema.OperationSuccess: True,
+                GuestAgentExtensionEventsSchema.Message: "The cgroup filesystem is ready to use",
+                GuestAgentExtensionEventsSchema.Duration: 1234,
+                GuestAgentExtensionEventsSchema.ExtensionType: "ALegacyExtensionType",
+                CommonTelemetryEventSchema.GAVersion: "WALinuxAgent-1.1.1",
+                CommonTelemetryEventSchema.ContainerId: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+                CommonTelemetryEventSchema.EventTid: 98765,
+                CommonTelemetryEventSchema.EventPid: 4321,
+                CommonTelemetryEventSchema.TaskName: "ALegacyTask",
+                CommonTelemetryEventSchema.KeywordName: "ALegacyKeywordName"},
             assert_timestamp=lambda timestamp:
-                self.assertEquals(timestamp, event_creation_time, "The event timestamp (opcode) is incorrect")
+                self.assertEqual(timestamp, event_creation_time, "The event timestamp (opcode) is incorrect")
         )
 
     def _assert_extension_event_includes_all_parameters_in_the_telemetry_schema(self, event_file):
@@ -636,22 +709,22 @@ class TestEvent(AgentTestCase):
 
         event_creation_time = TestEvent._get_file_creation_timestamp(test_file)
 
-        event_list = event.collect_events()
+        event_list = self._collect_events()
 
-        self.assertEquals(len(event_list.events), 1)
+        self.assertEqual(len(event_list), 1)
 
         self._assert_event_includes_all_parameters_in_the_telemetry_schema(
-            event_list.events[0],
+            event_list[0],
             expected_parameters={
-                'Name': 'Microsoft.Azure.Extensions.CustomScript',
-                'Version': '2.0.4',
-                'Operation': 'Scenario',
-                'OperationSuccess': True,
-                'Message': 'A test telemetry message.',
-                'Duration': 150000,
-                'ExtensionType': 'json'},
+                GuestAgentExtensionEventsSchema.Name: 'Microsoft.Azure.Extensions.CustomScript',
+                GuestAgentExtensionEventsSchema.Version: '2.0.4',
+                GuestAgentExtensionEventsSchema.Operation: TestEvent._Operation,
+                GuestAgentExtensionEventsSchema.OperationSuccess: True,
+                GuestAgentExtensionEventsSchema.Message: 'A test telemetry message.',
+                GuestAgentExtensionEventsSchema.Duration: 150000,
+                GuestAgentExtensionEventsSchema.ExtensionType: 'json'},
             assert_timestamp=lambda timestamp:
-                self.assertEquals(timestamp, event_creation_time, "The event timestamp (opcode) is incorrect")
+                self.assertEqual(timestamp, event_creation_time, "The event timestamp (opcode) is incorrect")
             )
 
     def test_collect_events_should_add_all_the_parameters_in_the_telemetry_schema_to_extension_events(self):
@@ -660,20 +733,125 @@ class TestEvent(AgentTestCase):
     def test_collect_events_should_ignore_extra_parameters_in_extension_events(self):
         self._assert_extension_event_includes_all_parameters_in_the_telemetry_schema('custom_script_extra_parameters.tld')
 
+    def test_report_event_should_encode_call_stack_correctly(self):
+        """
+        The Message in some telemetry events that include call stacks are being truncated in Kusto. While the issue doesn't seem
+        to be in the agent itself, this test verifies that the Message of the event we send in the HTTP request matches the
+        Message we read from the event's file.
+        """
+        def get_event_message_from_event_file(event_file):
+            with open(event_file, "rb") as fd:
+                event_data = fd.read().decode("utf-8")  # event files are UTF-8 encoded
+            telemetry_event = json.loads(event_data)
+
+            for p in telemetry_event['parameters']:
+                if p['name'] == GuestAgentExtensionEventsSchema.Message:
+                    return p['value']
+
+            raise ValueError('Could not find the Message for the telemetry event in {0}'.format(event_file))
+
+        def get_event_message_from_http_request_body(event_body):
+            # The XML for the event is sent over as a CDATA element ("Event") in the request's body
+            http_request_body = event_body if (
+                    event_body is None or type(event_body) is ustr) else textutil.str_to_encoded_ustr(event_body)
+            request_body_xml_doc = textutil.parse_doc(http_request_body)
+
+            event_node = textutil.find(request_body_xml_doc, "Event")
+            if event_node is None:
+                raise ValueError('Could not find the Event node in the XML document')
+            if len(event_node.childNodes) != 1:
+                raise ValueError('The Event node in the XML document should have exactly 1 child')
+
+            event_node_first_child = event_node.childNodes[0]
+            if event_node_first_child.nodeType != xml.dom.Node.CDATA_SECTION_NODE:
+                raise ValueError('The Event node contents should be CDATA')
+
+            event_node_cdata = event_node_first_child.nodeValue
+
+            # The CDATA will contain a sequence of "<Param Name='foo' Value='bar'/>" nodes, which
+            # correspond to the parameters of the telemetry event.  Wrap those into a "Helper" node
+            # and extract the "Message"
+            event_xml_text = '<?xml version="1.0"?><Helper>{0}</Helper>'.format(event_node_cdata)
+            event_xml_doc = textutil.parse_doc(event_xml_text)
+            helper_node = textutil.find(event_xml_doc, "Helper")
+
+            for child in helper_node.childNodes:
+                if child.getAttribute('Name') == GuestAgentExtensionEventsSchema.Message:
+                    return child.getAttribute('Value')
+
+            raise ValueError('Could not find the Message for the telemetry event. Request body: {0}'.format(http_request_body))
+
+        def http_post_handler(url, body, **__):
+            if self.is_telemetry_request(url):
+                http_post_handler.request_body = body
+                return MockHttpResponse(status=200)
+            return None
+        http_post_handler.request_body = None
+
+        with mock_wire_protocol(wire_protocol_data.DATA_FILE, http_post_handler=http_post_handler) as protocol:
+            event_file_path = self._create_test_event_file("event_with_callstack.waagent.tld")
+            expected_message = get_event_message_from_event_file(event_file_path)
+
+            event_list = self._collect_events()
+            self._report_events(protocol, event_list)
+
+            event_message = get_event_message_from_http_request_body(http_post_handler.request_body)
+
+            self.assertEqual(event_message, expected_message, "The Message in the HTTP request does not match the Message in the event's *.tld file")
+
+    def test_report_event_should_encode_events_correctly(self):
+
+        def http_post_handler(url, body, **__):
+            if self.is_telemetry_request(url):
+                http_post_handler.request_body = body
+                return MockHttpResponse(status=200)
+            return None
+        http_post_handler.request_body = None
+
+        with mock_wire_protocol(wire_protocol_data.DATA_FILE, http_post_handler=http_post_handler) as protocol:
+            test_messages = [
+                'Non-English message -  此文字不是英文的',
+                "Ξεσκεπάζω τὴν ψυχοφθόρα βδελυγμία",
+                "The quick brown fox jumps over the lazy dog",
+                "El pingüino Wenceslao hizo kilómetros bajo exhaustiva lluvia y frío, añoraba a su querido cachorro.",
+                "Portez ce vieux whisky au juge blond qui fume sur son île intérieure, à côté de l'alcôve ovoïde, où les bûches",
+                "se consument dans l'âtre, ce qui lui permet de penser à la cænogenèse de l'être dont il est question",
+                "dans la cause ambiguë entendue à Moÿ, dans un capharnaüm qui, pense-t-il, diminue çà et là la qualité de son œuvre.",
+                "D'fhuascail Íosa, Úrmhac na hÓighe Beannaithe, pór Éava agus Ádhaimh",
+                "Árvíztűrő tükörfúrógép",
+                "Kæmi ný öxi hér ykist þjófum nú bæði víl og ádrepa",
+                "Sævör grét áðan því úlpan var ónýt",
+                "いろはにほへとちりぬるを わかよたれそつねならむ うゐのおくやまけふこえて あさきゆめみしゑひもせす",
+                "? דג סקרן שט בים מאוכזב ולפתע מצא לו חברה איך הקליטה"
+                "Pchnąć w tę łódź jeża lub ośm skrzyń fig",
+                "Normal string event"
+            ]
+            for msg in test_messages:
+                add_event('TestEventEncoding', message=msg, op=TestEvent._Operation)
+                event_list = self._collect_events()
+                self._report_events(protocol, event_list)
+                # In Py2, encode() produces a str and in py3 it produces a bytes string.
+                # type(bytes) == type(str) for Py2 so this check is mainly for Py3 to ensure that the event is encoded properly.
+                self.assertIsInstance(http_post_handler.request_body, bytes, "The Event request body should be encoded")
+                self.assertIn(textutil.str_to_encoded_ustr(msg).encode('utf-8'), http_post_handler.request_body,
+                              "Encoded message not found in body")
+
 
 class TestMetrics(AgentTestCase):
     @patch('azurelinuxagent.common.event.EventLogger.save_event')
     def test_report_metric(self, mock_event):
         event.report_metric("cpu", "%idle", "_total", 10.0)
         self.assertEqual(1, mock_event.call_count)
+
         event_json = mock_event.call_args[0][0]
         self.assertIn(event.TELEMETRY_EVENT_PROVIDER_ID, event_json)
         self.assertIn("%idle", event_json)
-        import json
+
         event_dictionary = json.loads(event_json)
         self.assertEqual(event_dictionary['providerId'], event.TELEMETRY_EVENT_PROVIDER_ID)
+
         for parameter in event_dictionary["parameters"]:
-            if parameter['name'] == 'Counter':
+            if parameter['name'] == GuestAgentPerfCounterEventsSchema.Counter:
                 self.assertEqual(parameter['value'], '%idle')
                 break
         else:
@@ -719,11 +897,11 @@ class TestMetrics(AgentTestCase):
                          ev_logger._clean_up_message('[PERIODIC] Daemon Cgroup controller "memory" is not mounted. '
                                                      'Failed to create a cgroup for the VM Agent; resource usage will '
                                                      'not be tracked'))
-        self.assertEquals('The time should be in UTC', ev_logger._clean_up_message(
+        self.assertEqual('The time should be in UTC', ev_logger._clean_up_message(
             '2019-11-26T18:15:06.866746Z INFO The time should be in UTC'))
-        self.assertEquals('The time should be in UTC', ev_logger._clean_up_message(
+        self.assertEqual('The time should be in UTC', ev_logger._clean_up_message(
             '2019-11-26T18:15:06.866746Z The time should be in UTC'))
-        self.assertEquals('[PERIODIC] The time should be in UTC', ev_logger._clean_up_message(
+        self.assertEqual('[PERIODIC] The time should be in UTC', ev_logger._clean_up_message(
             '2019-11-26T18:15:06.866746Z INFO [PERIODIC] The time should be in UTC'))
-        self.assertEquals('[PERIODIC] The time should be in UTC', ev_logger._clean_up_message(
+        self.assertEqual('[PERIODIC] The time should be in UTC', ev_logger._clean_up_message(
             '2019-11-26T18:15:06.866746Z [PERIODIC] The time should be in UTC'))

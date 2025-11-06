@@ -14,25 +14,28 @@
 #
 # Requires Python 2.6+ and Openssl 1.0+
 #
-
-import socket
+import contextlib
 import glob
-import mock
-import traceback
 import os
+import socket
+import subprocess
 import tempfile
 import unittest
 
+import mock
+
+import azurelinuxagent.common.conf as conf
 import azurelinuxagent.common.osutil.default as osutil
 import azurelinuxagent.common.utils.shellutil as shellutil
 import azurelinuxagent.common.utils.textutil as textutil
-import azurelinuxagent.common.conf as conf
 from azurelinuxagent.common.exception import OSUtilError
 from azurelinuxagent.common.future import ustr
 from azurelinuxagent.common.osutil import get_osutil
 from azurelinuxagent.common.utils import fileutil
-from tests.tools import AgentTestCase, call, patch, open_patch, load_data, \
-    running_under_travis, skip_if_predicate_true
+from azurelinuxagent.common.utils.flexible_version import FlexibleVersion
+from azurelinuxagent.common.utils.networkutil import AddFirewallRules
+from tests.lib.mock_environment import MockEnvironment
+from tests.lib.tools import AgentTestCase, patch, open_patch, load_data, data_dir, is_python_version_26_or_34, skip_if_predicate_true
 
 actual_get_proc_net_route = 'azurelinuxagent.common.osutil.default.DefaultOSUtil._get_proc_net_route'
 
@@ -42,13 +45,6 @@ def fake_is_loopback(_, iface):
 
 
 class TestOSUtil(AgentTestCase):
-
-    def setUp(self):
-        AgentTestCase.setUp(self)
-
-    def tearDown(self):
-        AgentTestCase.tearDown(self)
-
     def test_restart(self):
         # setup
         retries = 3
@@ -62,7 +58,7 @@ class TestOSUtil(AgentTestCase):
             # assert
             self.assertEqual(run_patch.call_count, retries)
             self.assertEqual(run_patch.call_args_list[0][0][0], 'ifdown {0} && ifup {0}'.format(ifname))
-
+                
     def test_get_dvd_device_success(self):
         with patch.object(os, 'listdir', return_value=['cpu', 'cdrom0']):
             osutil.DefaultOSUtil().get_dvd_device()
@@ -81,9 +77,7 @@ class TestOSUtil(AgentTestCase):
         with patch.object(osutil.DefaultOSUtil,
                           'get_dvd_device',
                           return_value='/dev/cdrom'):
-            with patch.object(shellutil,
-                              'run_get_output',
-                              return_value=(0, msg)) as patch_run:
+            with patch.object(shellutil, 'run_command', return_value=msg):
                 with patch.object(os, 'makedirs'):
                     try:
                         osutil.DefaultOSUtil().mount_dvd()
@@ -92,20 +86,22 @@ class TestOSUtil(AgentTestCase):
 
     @patch('time.sleep')
     def test_mount_dvd_failure(self, _):
+        
         msg = 'message'
+        exception = shellutil.CommandError("mount dvd", 1, "", msg)
+        
         with patch.object(osutil.DefaultOSUtil,
                           'get_dvd_device',
                           return_value='/dev/cdrom'):
-            with patch.object(shellutil,
-                              'run_get_output',
-                              return_value=(1, msg)) as patch_run:
+            with patch.object(shellutil, 'run_command',
+                side_effect=exception) as patch_run:
                 with patch.object(os, 'makedirs'):
                     try:
                         osutil.DefaultOSUtil().mount_dvd()
                         self.fail('OSUtilError was not raised')
                     except OSUtilError as ose:
                         self.assertTrue(msg in ustr(ose))
-                        self.assertTrue(patch_run.call_count == 6)
+                        self.assertEqual(patch_run.call_count, 5)
 
     def test_empty_proc_net_route(self):
         routing_table = ""
@@ -167,7 +163,7 @@ class TestOSUtil(AgentTestCase):
     @patch('azurelinuxagent.common.osutil.default.DefaultOSUtil.get_primary_interface', return_value='eth0')
     @patch('azurelinuxagent.common.osutil.default.DefaultOSUtil._get_all_interfaces', return_value={'eth0':'10.0.0.1'})
     @patch('azurelinuxagent.common.osutil.default.DefaultOSUtil.is_loopback', fake_is_loopback)
-    def test_get_first_if(self, get_all_interfaces_mock, get_primary_interface_mock):
+    def test_get_first_if(self, get_all_interfaces_mock, get_primary_interface_mock):  # pylint: disable=unused-argument
         """
         Validate that the agent can find the first active non-loopback
         interface.
@@ -183,7 +179,7 @@ class TestOSUtil(AgentTestCase):
     @patch('azurelinuxagent.common.osutil.default.DefaultOSUtil.get_primary_interface', return_value='bogus0')
     @patch('azurelinuxagent.common.osutil.default.DefaultOSUtil._get_all_interfaces', return_value={'eth0':'10.0.0.1', 'lo': '127.0.0.1'})
     @patch('azurelinuxagent.common.osutil.default.DefaultOSUtil.is_loopback', fake_is_loopback)
-    def test_get_first_if_nosuchprimary(self, get_all_interfaces_mock, get_primary_interface_mock):
+    def test_get_first_if_nosuchprimary(self, get_all_interfaces_mock, get_primary_interface_mock):  # pylint: disable=unused-argument
         ifname, ipaddr = osutil.DefaultOSUtil().get_first_if()
         self.assertTrue(ifname.startswith('eth'))
         self.assertTrue(ipaddr is not None)
@@ -294,26 +290,40 @@ class TestOSUtil(AgentTestCase):
             patch_primary.return_value = ''
             try:
                 osutil.DefaultOSUtil().get_first_if()[0]
-            except Exception as e:
-                print(traceback.format_exc())
+            except Exception as e:  # pylint: disable=unused-variable
+                print(textutil.format_exception(e))
                 exception = True
             self.assertFalse(exception)
 
     def test_dhcp_lease_default(self):
         self.assertTrue(osutil.DefaultOSUtil().get_dhcp_lease_endpoint() is None)
 
-    def test_dhcp_lease_ubuntu(self):
+    def test_dhcp_lease_older_ubuntu(self):
         with patch.object(glob, "glob", return_value=['/var/lib/dhcp/dhclient.eth0.leases']):
             with patch(open_patch(), mock.mock_open(read_data=load_data("dhcp.leases"))):
-                endpoint = get_osutil(distro_name='ubuntu', distro_version='12.04').get_dhcp_lease_endpoint()
+                endpoint = get_osutil(distro_name='ubuntu', distro_version='12.04').get_dhcp_lease_endpoint()  # pylint: disable=assignment-from-none
                 self.assertTrue(endpoint is not None)
                 self.assertEqual(endpoint, "168.63.129.16")
 
-                endpoint = get_osutil(distro_name='ubuntu', distro_version='12.04').get_dhcp_lease_endpoint()
+                endpoint = get_osutil(distro_name='ubuntu', distro_version='12.04').get_dhcp_lease_endpoint()  # pylint: disable=assignment-from-none
                 self.assertTrue(endpoint is not None)
                 self.assertEqual(endpoint, "168.63.129.16")
 
-                endpoint = get_osutil(distro_name='ubuntu', distro_version='14.04').get_dhcp_lease_endpoint()
+                endpoint = get_osutil(distro_name='ubuntu', distro_version='14.04').get_dhcp_lease_endpoint()  # pylint: disable=assignment-from-none
+                self.assertTrue(endpoint is not None)
+                self.assertEqual(endpoint, "168.63.129.16")
+
+                endpoint = get_osutil(distro_name='ubuntu', distro_version='18.04').get_dhcp_lease_endpoint()  # pylint: disable=assignment-from-none
+                self.assertTrue(endpoint is None)
+
+    def test_dhcp_lease_newer_ubuntu(self):
+        with patch.object(glob, "glob", return_value=['/run/systemd/netif/leases/2']):
+            with patch(open_patch(), mock.mock_open(read_data=load_data("2"))):
+                endpoint = get_osutil(distro_name='ubuntu', distro_version='18.04').get_dhcp_lease_endpoint()  # pylint: disable=assignment-from-none
+                self.assertTrue(endpoint is not None)
+                self.assertEqual(endpoint, "168.63.129.16")
+
+                endpoint = get_osutil(distro_name='ubuntu', distro_version='20.04').get_dhcp_lease_endpoint()  # pylint: disable=assignment-from-none
                 self.assertTrue(endpoint is not None)
                 self.assertEqual(endpoint, "168.63.129.16")
 
@@ -325,13 +335,13 @@ class TestOSUtil(AgentTestCase):
         """
         with patch.object(glob, "glob", return_value=['/var/lib/dhcp/dhclient.eth0.leases']):
             with patch(open_patch(), mock.mock_open(read_data=load_data("dhcp.leases.custom.dns"))):
-                endpoint = get_osutil(distro_name='ubuntu', distro_version='14.04').get_dhcp_lease_endpoint()
+                endpoint = get_osutil(distro_name='ubuntu', distro_version='14.04').get_dhcp_lease_endpoint()  # pylint: disable=assignment-from-none
                 self.assertEqual(endpoint, "168.63.129.16")
 
     def test_dhcp_lease_multi(self):
         with patch.object(glob, "glob", return_value=['/var/lib/dhcp/dhclient.eth0.leases']):
             with patch(open_patch(), mock.mock_open(read_data=load_data("dhcp.leases.multi"))):
-                endpoint = get_osutil(distro_name='ubuntu', distro_version='12.04').get_dhcp_lease_endpoint()
+                endpoint = get_osutil(distro_name='ubuntu', distro_version='12.04').get_dhcp_lease_endpoint()  # pylint: disable=assignment-from-none
                 self.assertTrue(endpoint is not None)
                 self.assertEqual(endpoint, "168.63.129.2")
 
@@ -522,7 +532,7 @@ Match host 192.168.1.2\n\
     @patch('os.path.isfile', return_value=True)
     @patch('azurelinuxagent.common.utils.fileutil.read_file',
             return_value="33C2F3B9-1399-429F-8EB3-BA656DF32502")
-    def test_get_instance_id_from_file(self, mock_read, mock_isfile):
+    def test_get_instance_id_from_file(self, mock_read, mock_isfile):  # pylint: disable=unused-argument
         util = osutil.DefaultOSUtil()
         self.assertEqual(
             util.get_instance_id(),
@@ -531,7 +541,7 @@ Match host 192.168.1.2\n\
     @patch('os.path.isfile', return_value=True)
     @patch('azurelinuxagent.common.utils.fileutil.read_file',
             return_value="")
-    def test_get_instance_id_empty_from_file(self, mock_read, mock_isfile):
+    def test_get_instance_id_empty_from_file(self, mock_read, mock_isfile):  # pylint: disable=unused-argument
         util = osutil.DefaultOSUtil()
         self.assertEqual(
             "",
@@ -540,7 +550,7 @@ Match host 192.168.1.2\n\
     @patch('os.path.isfile', return_value=True)
     @patch('azurelinuxagent.common.utils.fileutil.read_file',
             return_value="Value")
-    def test_get_instance_id_malformed_from_file(self, mock_read, mock_isfile):
+    def test_get_instance_id_malformed_from_file(self, mock_read, mock_isfile):  # pylint: disable=unused-argument
         util = osutil.DefaultOSUtil()
         self.assertEqual(
             "Value",
@@ -549,7 +559,7 @@ Match host 192.168.1.2\n\
     @patch('os.path.isfile', return_value=False)
     @patch('azurelinuxagent.common.utils.shellutil.run_get_output',
             return_value=[0, '33C2F3B9-1399-429F-8EB3-BA656DF32502'])
-    def test_get_instance_id_from_dmidecode(self, mock_shell, mock_isfile):
+    def test_get_instance_id_from_dmidecode(self, mock_shell, mock_isfile):  # pylint: disable=unused-argument
         util = osutil.DefaultOSUtil()
         self.assertEqual(
             util.get_instance_id(),
@@ -558,20 +568,20 @@ Match host 192.168.1.2\n\
     @patch('os.path.isfile', return_value=False)
     @patch('azurelinuxagent.common.utils.shellutil.run_get_output',
             return_value=[1, 'Error Value'])
-    def test_get_instance_id_missing(self, mock_shell, mock_isfile):
+    def test_get_instance_id_missing(self, mock_shell, mock_isfile):  # pylint: disable=unused-argument
         util = osutil.DefaultOSUtil()
         self.assertEqual("", util.get_instance_id())
 
     @patch('os.path.isfile', return_value=False)
     @patch('azurelinuxagent.common.utils.shellutil.run_get_output',
             return_value=[0, 'Unexpected Value'])
-    def test_get_instance_id_unexpected(self, mock_shell, mock_isfile):
+    def test_get_instance_id_unexpected(self, mock_shell, mock_isfile):  # pylint: disable=unused-argument
         util = osutil.DefaultOSUtil()
         self.assertEqual("", util.get_instance_id())
 
     @patch('os.path.isfile', return_value=True)
     @patch('azurelinuxagent.common.utils.fileutil.read_file')
-    def test_is_current_instance_id_from_file(self, mock_read, mock_isfile):
+    def test_is_current_instance_id_from_file(self, mock_read, mock_isfile):  # pylint: disable=unused-argument
         util = osutil.DefaultOSUtil()
 
         mock_read.return_value = "11111111-2222-3333-4444-556677889900"
@@ -596,7 +606,7 @@ Match host 192.168.1.2\n\
 
     @patch('os.path.isfile', return_value=False)
     @patch('azurelinuxagent.common.utils.shellutil.run_get_output')
-    def test_is_current_instance_id_from_dmidecode(self, mock_shell, mock_isfile):
+    def test_is_current_instance_id_from_dmidecode(self, mock_shell, mock_isfile):  # pylint: disable=unused-argument
         util = osutil.DefaultOSUtil()
 
         mock_shell.return_value = [0, 'B9F3C233-9913-9F42-8EB3-BA656DF32502']
@@ -633,279 +643,328 @@ Match host 192.168.1.2\n\
         print("WRITING TO {0}".format(waagent_sudoers))
         self.assertEqual(1, count)
 
+    @staticmethod
+    def _command_to_string(command):
+        return " ".join(command) if isinstance(command, list) else command
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _mock_iptables(version=osutil._IPTABLES_LOCKING_VERSION, destination='168.63.129.16'):
+        """
+        Mock for the iptable commands used to set up the firewall.
+
+        Returns a patch of subprocess.Popen augmented with these properties:
+
+            * wait - True if the iptable commands use the -w option
+            * destination - The target IP address
+            * uid - The uid used for the -owner option
+            * command_calls - A list of the iptable commands executed by the mock (the --version and -L commands are omitted)
+            * set_command - By default all the mocked commands succeed and produce no output; this method can be used to override
+                  the return value and output of these commands (or to add other commands)
+        """
+        mocked_commands = {}
+
+        def set_command(command, output='', exit_code=0):
+            command_string = TestOSUtil._command_to_string(command)
+            mocked_commands[command_string] = (output.replace("'", "'\"'\"'"), exit_code)
+            return command_string
+
+        wait = "-w" if FlexibleVersion(version) >= osutil._IPTABLES_LOCKING_VERSION else ""
+        uid = 42
+
+        version_command = set_command(osutil.get_iptables_version_command(), output=str(version))
+        list_command = set_command(osutil.get_firewall_list_command(wait), output="Mock Output")
+        set_command(osutil.get_firewall_packets_command(wait))
+        set_command(AddFirewallRules.get_wire_non_root_drop_rule(AddFirewallRules.CHECK_COMMAND, destination, wait=wait))
+        set_command(AddFirewallRules.get_wire_non_root_drop_rule(AddFirewallRules.APPEND_COMMAND, destination, wait=wait))
+        set_command(AddFirewallRules.get_wire_root_accept_rule(AddFirewallRules.CHECK_COMMAND, destination, uid, wait=wait))
+        set_command(AddFirewallRules.get_wire_root_accept_rule(AddFirewallRules.APPEND_COMMAND, destination, uid, wait=wait))
+        set_command(AddFirewallRules.get_accept_tcp_rule(AddFirewallRules.APPEND_COMMAND, destination, wait=wait))
+        set_command(AddFirewallRules.get_accept_tcp_rule(AddFirewallRules.INSERT_COMMAND, destination, wait=wait))
+        set_command(AddFirewallRules.get_accept_tcp_rule(AddFirewallRules.CHECK_COMMAND, destination, wait=wait))
+        # the agent assumes the rules have been deleted when these commands return 1
+        set_command(osutil.get_firewall_delete_conntrack_accept_command(wait, destination), exit_code=1)
+        set_command(osutil.get_delete_accept_tcp_rule(wait, destination), exit_code=1)
+        set_command(osutil.get_firewall_delete_owner_accept_command(wait, destination, uid), exit_code=1)
+        set_command(osutil.get_firewall_delete_conntrack_drop_command(wait, destination), exit_code=1)
+
+        command_calls = []
+
+        def mock_popen(command, *args, **kwargs):
+            command_string = TestOSUtil._command_to_string(command)
+            if command_string in mocked_commands:
+                if command_string != version_command and command_string != list_command:
+                    command_calls.append(command_string)
+                output, exit_code = mocked_commands[command_string]
+                command = "echo '{0}' && exit {1}".format(output, exit_code)
+                kwargs["shell"] = True
+            return mock_popen.original(command, *args, **kwargs)
+        mock_popen.original = subprocess.Popen
+
+        with patch("azurelinuxagent.ga.cgroupapi.subprocess.Popen", side_effect=mock_popen) as popen_patcher:
+            with patch('os.getuid', return_value=uid):
+                popen_patcher.wait = wait
+                popen_patcher.destination = destination
+                popen_patcher.uid = uid
+                popen_patcher.set_command = set_command
+                popen_patcher.command_calls = command_calls
+
+                yield popen_patcher
+
     def test_get_firewall_dropped_packets_returns_zero_if_firewall_disabled(self):
-        osutil._enable_firewall = False
-        util = osutil.DefaultOSUtil()
+        with patch.object(osutil, '_enable_firewall', False):
+            util = osutil.DefaultOSUtil()
 
-        self.assertEqual(0, util.get_firewall_dropped_packets("not used"))
+            self.assertEqual(0, util.get_firewall_dropped_packets("not used"))
 
-    @patch('azurelinuxagent.common.utils.shellutil.run_get_output')
-    def test_get_firewall_dropped_packets_returns_negative_if_error(self, mock_output):
-        osutil._enable_firewall = True
-        util = osutil.DefaultOSUtil()
+    def test_get_firewall_dropped_packets_returns_negative_if_error(self):
+        with TestOSUtil._mock_iptables() as mock_iptables:
+            with patch.object(osutil, '_enable_firewall', True):
+                mock_iptables.set_command(osutil.get_firewall_packets_command(mock_iptables.wait), exit_code=1)
+                self.assertEqual(-1, osutil.DefaultOSUtil().get_firewall_dropped_packets())
 
-        mock_output.side_effect = [
-            (0, "iptables v{0}".format(osutil.IPTABLES_LOCKING_VERSION)),
-            (1, "not used")]
-        self.assertEqual(-1, util.get_firewall_dropped_packets("not used"))
+    def test_get_firewall_dropped_packets_should_ignore_transient_errors(self):
 
-    @patch('azurelinuxagent.common.utils.shellutil.run_get_output')
-    def test_get_firewall_dropped_packets_returns_negative_if_exception(self, mock_output):
-        osutil._enable_firewall = True
-        util = osutil.DefaultOSUtil()
+        with TestOSUtil._mock_iptables() as mock_iptables:
+            with patch.object(osutil, '_enable_firewall', True):
+                mock_iptables.set_command(osutil.get_firewall_packets_command(mock_iptables.wait), exit_code=3, output="can't initialize iptables table `security': iptables who? (do you need to insmod?)")
+                self.assertEqual(0, osutil.DefaultOSUtil().get_firewall_dropped_packets())
 
-        mock_output.side_effect = [
-            (0, "iptables v{0}".format(osutil.IPTABLES_LOCKING_VERSION)),
-            (1, Exception)]
-        self.assertEqual(-1, util.get_firewall_dropped_packets("not used"))
+    def test_get_firewall_dropped_packets_should_ignore_returncode_4(self):
 
-    @patch('azurelinuxagent.common.utils.shellutil.run_get_output')
-    def test_get_firewall_dropped_packets_transient_error_ignored(self, mock_output):
-        osutil._enable_firewall = True
-        util = osutil.DefaultOSUtil()
+        with TestOSUtil._mock_iptables() as mock_iptables:
+            with patch.object(osutil, '_enable_firewall', True):
+                mock_iptables.set_command(osutil.get_firewall_packets_command(mock_iptables.wait), exit_code=4, output="iptables v1.8.2 (nf_tables): RULE_REPLACE failed (Invalid argument): rule in chain OUTPUT")
+                self.assertEqual(0, osutil.DefaultOSUtil().get_firewall_dropped_packets())
 
-        mock_output.side_effect = [
-            (0, "iptables v{0}".format(osutil.IPTABLES_LOCKING_VERSION)),
-            (3, "can't initialize iptables table `security': iptables who? (do you need to insmod?)")]
-        self.assertEqual(0, util.get_firewall_dropped_packets("not used"))
+    def test_get_firewall_dropped_packets(self):
 
-    @patch('azurelinuxagent.common.utils.shellutil.run_get_output')
-    def test_get_firewall_dropped_packets(self, mock_output):
-        osutil._enable_firewall = True
-        util = osutil.DefaultOSUtil()
+        destination = '168.63.129.16'
 
-        mock_output.side_effect = [
-            (0, "iptables v{0}".format(osutil.IPTABLES_LOCKING_VERSION)),
-            (0,
-'''
+        with TestOSUtil._mock_iptables() as mock_iptables:
+            with patch.object(osutil, '_enable_firewall', True):
 
-Chain OUTPUT (policy ACCEPT 104 packets, 43628 bytes)
-    pkts      bytes target     prot opt in     out     source               destination
-       0        0 ACCEPT     tcp  --  any    any     anywhere             168.63.129.16        owner UID match daemon
-      32     1920 DROP       tcp  --  any    any     anywhere             168.63.129.16
+                mock_iptables.set_command(osutil.get_firewall_packets_command(mock_iptables.wait), output='''
+    
+    Chain OUTPUT (policy ACCEPT 104 packets, 43628 bytes)
+        pkts      bytes target     prot opt in     out     source               destination
+           0        0 ACCEPT     tcp  --  any    any     anywhere             168.63.129.16        owner UID match daemon
+          32     1920 DROP       tcp  --  any    any     anywhere             168.63.129.16
+    
+    ''')
+                self.assertEqual(32, osutil.DefaultOSUtil().get_firewall_dropped_packets(destination))
 
-''')]
-        dst = '168.63.129.16'
+    def test_enable_firewall_should_set_up_the_firewall(self):
 
-        self.assertEqual(32, util.get_firewall_dropped_packets(dst))
+        with TestOSUtil._mock_iptables() as mock_iptables:
+            with patch.object(osutil, '_enable_firewall', True):
+                # fail the rule check to force enable of the firewall
+                mock_iptables.set_command(AddFirewallRules.get_accept_tcp_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination,
+                                                                               wait=mock_iptables.wait), exit_code=0)
+                mock_iptables.set_command(AddFirewallRules.get_wire_root_accept_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination, mock_iptables.uid,
+                                                                                     wait=mock_iptables.wait), exit_code=0)
+                mock_iptables.set_command(AddFirewallRules.get_wire_non_root_drop_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination,
+                                                                                       wait=mock_iptables.wait), exit_code=1)
 
-    @patch('os.getuid', return_value=42)
-    @patch('azurelinuxagent.common.utils.shellutil.run_get_output')
-    @patch('azurelinuxagent.common.utils.shellutil.run')
-    def test_enable_firewall(self, mock_run, mock_output, mock_uid):
-        osutil._enable_firewall = True
-        util = osutil.DefaultOSUtil()
+                success, _ = osutil.DefaultOSUtil().enable_firewall(dst_ip=mock_iptables.destination, uid=mock_iptables.uid)
 
-        dst = '1.2.3.4'
-        uid = 42
-        version = "iptables v{0}".format(osutil.IPTABLES_LOCKING_VERSION)
-        wait = "-w"
+                tcp_check_command = TestOSUtil._command_to_string(AddFirewallRules.get_accept_tcp_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination,
+                                                                               wait=mock_iptables.wait))
+                accept_check_command = TestOSUtil._command_to_string(AddFirewallRules.get_wire_root_accept_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination, mock_iptables.uid,
+                                                                                                                wait=mock_iptables.wait))
+                drop_check_command = TestOSUtil._command_to_string(AddFirewallRules.get_wire_non_root_drop_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination,
+                                                                                                                wait=mock_iptables.wait))
+                delete_conntrack_accept_command = TestOSUtil._command_to_string(osutil.get_firewall_delete_conntrack_accept_command(mock_iptables.wait, mock_iptables.destination))
+                delete_accept_tcp_rule = TestOSUtil._command_to_string(osutil.get_delete_accept_tcp_rule(mock_iptables.wait, mock_iptables.destination))
+                delete_owner_accept_command = TestOSUtil._command_to_string(osutil.get_firewall_delete_owner_accept_command(mock_iptables.wait, mock_iptables.destination, mock_iptables.uid))
+                delete_conntrack_drop_command = TestOSUtil._command_to_string(osutil.get_firewall_delete_conntrack_drop_command(mock_iptables.wait, mock_iptables.destination))
+                accept_tcp_command = TestOSUtil._command_to_string(AddFirewallRules.get_accept_tcp_rule(AddFirewallRules.APPEND_COMMAND, mock_iptables.destination, wait=mock_iptables.wait))
+                accept_command = TestOSUtil._command_to_string(AddFirewallRules.get_wire_root_accept_rule(AddFirewallRules.APPEND_COMMAND, mock_iptables.destination, mock_iptables.uid, wait=mock_iptables.wait))
+                drop_add_command = TestOSUtil._command_to_string(AddFirewallRules.get_wire_non_root_drop_rule(AddFirewallRules.APPEND_COMMAND, mock_iptables.destination, wait=mock_iptables.wait))
 
-        mock_run.side_effect = [1, 0, 0]
-        mock_output.side_effect = [(0, version), (0, "Output")]
-        self.assertTrue(util.enable_firewall(dst_ip=dst, uid=uid))
+                self.assertTrue(success, "Enabling the firewall was not successful")
+                # Exactly 10 calls have to be made.
+                # First is the check rule check which was mocked to fail, and delete call and then append calls
+                self.assertEqual(len(mock_iptables.command_calls), 10, "Incorrect number of calls to iptables: [{0}]". format(mock_iptables.command_calls))
+                self.assertEqual(mock_iptables.command_calls[0], tcp_check_command, "The first command should check the tcp rule")
+                self.assertEqual(mock_iptables.command_calls[1], accept_check_command, "The second command should check the accept rule")
+                self.assertEqual(mock_iptables.command_calls[2], drop_check_command, "The third command should check the drop rule")
+                self.assertEqual(mock_iptables.command_calls[3], delete_conntrack_accept_command,
+                                 "The fourth command should delete the conntrack accept rule: {0}".format(
+                                     mock_iptables.command_calls[3]))
+                self.assertEqual(mock_iptables.command_calls[4], delete_accept_tcp_rule,
+                                 "The fifth command should delete the dns tcp accept rule: {0}".format(
+                                     mock_iptables.command_calls[4]))
+                self.assertEqual(mock_iptables.command_calls[5], delete_owner_accept_command,
+                                 "The sixth command should delete the owner accept rule: {0}".format(
+                                     mock_iptables.command_calls[5]))
+                self.assertEqual(mock_iptables.command_calls[6], delete_conntrack_drop_command,
+                                 "The seventh command should delete the conntrack accept rule : {0}".format(
+                                     mock_iptables.command_calls[6]))
+                self.assertEqual(mock_iptables.command_calls[7], accept_tcp_command,
+                                "The eighth command should add the dns tcp accept rule")
+                self.assertEqual(mock_iptables.command_calls[8], accept_command, "The ninth command should add the accept rule")
+                self.assertEqual(mock_iptables.command_calls[9], drop_add_command, "The tenth command should add the drop rule")
 
-        mock_run.assert_has_calls([
-            call(osutil.FIREWALL_DROP.format(wait, "C", dst), chk_err=False),
-            call(osutil.FIREWALL_ACCEPT.format(wait, "A", dst, uid)),
-            call(osutil.FIREWALL_DROP.format(wait, "A", dst))
-        ])
-        mock_output.assert_has_calls([
-            call(osutil.IPTABLES_VERSION),
-            call(osutil.FIREWALL_LIST.format(wait))
-        ])
-        self.assertTrue(osutil._enable_firewall)
+                self.assertTrue(osutil._enable_firewall, "The firewall should not have been disabled")
 
-    @patch('os.getuid', return_value=42)
-    @patch('azurelinuxagent.common.utils.shellutil.run_get_output')
-    @patch('azurelinuxagent.common.utils.shellutil.run')
-    def test_enable_firewall_no_wait(self, mock_run, mock_output, mock_uid):
-        osutil._enable_firewall = True
-        util = osutil.DefaultOSUtil()
+    def test_enable_firewall_should_not_use_wait_when_iptables_does_not_support_it(self):
+        with TestOSUtil._mock_iptables(version=osutil._IPTABLES_LOCKING_VERSION - 1) as mock_iptables:
+            with patch.object(osutil, '_enable_firewall', True):
+                # fail the rule check to force enable of the firewall
+                mock_iptables.set_command(AddFirewallRules.get_accept_tcp_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination,
+                                                                               wait=mock_iptables.wait), exit_code=1)
+                mock_iptables.set_command(AddFirewallRules.get_wire_root_accept_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination, mock_iptables.uid,
+                                                                                     wait=mock_iptables.wait), exit_code=1)
+                mock_iptables.set_command(AddFirewallRules.get_wire_non_root_drop_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination,
+                                                                                       wait=mock_iptables.wait), exit_code=1)
 
-        dst = '1.2.3.4'
-        uid = 42
-        version = "iptables v{0}".format(osutil.IPTABLES_LOCKING_VERSION-1)
-        wait = ""
+                success, _ = osutil.DefaultOSUtil().enable_firewall(dst_ip=mock_iptables.destination, uid=mock_iptables.uid)
 
-        mock_run.side_effect = [1, 0, 0]
-        mock_output.side_effect = [(0, version), (0, "Output")]
-        self.assertTrue(util.enable_firewall(dst_ip=dst, uid=uid))
+                self.assertTrue(success, "Enabling the firewall was not successful")
+                # Exactly 10 calls have to be made.
+                # First check 3 rules, delete 4 rules,
+                # and Append the IPTable 3 rules.
+                self.assertEqual(len(mock_iptables.command_calls), 10,
+                                 "Incorrect number of calls to iptables: [{0}]".format(mock_iptables.command_calls))
+                for command in mock_iptables.command_calls:
+                    self.assertNotIn("-w", command, "The -w option sh       ould have been used in {0}".format(command))
 
-        mock_run.assert_has_calls([
-            call(osutil.FIREWALL_DROP.format(wait, "C", dst), chk_err=False),
-            call(osutil.FIREWALL_ACCEPT.format(wait, "A", dst, uid)),
-            call(osutil.FIREWALL_DROP.format(wait, "A", dst))
-        ])
-        mock_output.assert_has_calls([
-            call(osutil.IPTABLES_VERSION),
-            call(osutil.FIREWALL_LIST.format(wait))
-        ])
-        self.assertTrue(osutil._enable_firewall)
+                self.assertTrue(osutil._enable_firewall, "The firewall should not have been disabled")
 
-    @patch('os.getuid', return_value=42)
-    @patch('azurelinuxagent.common.utils.shellutil.run_get_output')
-    @patch('azurelinuxagent.common.utils.shellutil.run')
-    def test_enable_firewall_skips_if_drop_exists(self, mock_run, mock_output, mock_uid):
-        osutil._enable_firewall = True
-        util = osutil.DefaultOSUtil()
+    def test_enable_firewall_should_not_set_firewall_if_the_all_the_rules_exists(self):
 
-        dst = '1.2.3.4'
-        uid = 42
-        version = "iptables v{0}".format(osutil.IPTABLES_LOCKING_VERSION)
-        wait = "-w"
+        with TestOSUtil._mock_iptables() as mock_iptables:
+            with patch.object(osutil, '_enable_firewall', True):
+                tcp_check_command = mock_iptables.set_command(AddFirewallRules.get_accept_tcp_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination,
+                                                                               wait=mock_iptables.wait), exit_code=0)
+                accept_check_command = mock_iptables.set_command(AddFirewallRules.get_wire_root_accept_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination, mock_iptables.uid,
+                                                                                                            wait=mock_iptables.wait), exit_code=0)
+                drop_check_command = mock_iptables.set_command(AddFirewallRules.get_wire_non_root_drop_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination,
+                                                                                                            wait=mock_iptables.wait), exit_code=0)
 
-        mock_run.side_effect = [0, 0, 0]
-        mock_output.return_value = (0, version)
-        self.assertTrue(util.enable_firewall(dst_ip=dst, uid=uid))
+                success, _ = osutil.DefaultOSUtil().enable_firewall(dst_ip=mock_iptables.destination, uid=mock_iptables.uid)
 
-        mock_run.assert_has_calls([
-            call(osutil.FIREWALL_DROP.format(wait, "C", dst), chk_err=False),
-        ])
-        mock_output.assert_has_calls([
-            call(osutil.IPTABLES_VERSION)
-        ])
-        self.assertTrue(osutil._enable_firewall)
+                self.assertTrue(success, "Enabling the firewall was not successful")
+                self.assertEqual(len(mock_iptables.command_calls), 3, "Incorrect number of calls to iptables: [{0}]". format(mock_iptables.command_calls))
+                self.assertEqual(mock_iptables.command_calls[0], tcp_check_command, "Unexpected command: {0}".format(mock_iptables.command_calls[0]))
+                self.assertEqual(mock_iptables.command_calls[1], accept_check_command, "Unexpected command: {0}".format(mock_iptables.command_calls[1]))
+                self.assertEqual(mock_iptables.command_calls[2], drop_check_command, "Unexpected command: {0}".format(mock_iptables.command_calls[2]))
 
-    @patch('os.getuid', return_value=42)
-    @patch('azurelinuxagent.common.utils.shellutil.run_get_output')
-    @patch('azurelinuxagent.common.utils.shellutil.run')
-    def test_enable_firewall_ignores_exceptions(self, mock_run, mock_output, mock_uid):
-        osutil._enable_firewall = True
-        util = osutil.DefaultOSUtil()
+                self.assertTrue(osutil._enable_firewall)
 
-        dst = '1.2.3.4'
-        uid = 42
-        version = "iptables v{0}".format(osutil.IPTABLES_LOCKING_VERSION)
-        wait = "-w"
+    def test_enable_firewall_should_check_for_invalid_iptables_options(self):
 
-        mock_run.side_effect = [1, Exception]
-        mock_output.return_value = (0, version)
-        self.assertFalse(util.enable_firewall(dst_ip=dst, uid=uid))
+        with TestOSUtil._mock_iptables() as mock_iptables:
+            with patch.object(osutil, '_enable_firewall', True):
+                # iptables uses the following exit codes
+                #  0 - correct function
+                #  1 - other errors
+                #  2 - errors which appear to be caused by invalid or abused command
+                #      line parameters
+                tcp_check_command = mock_iptables.set_command(AddFirewallRules.get_accept_tcp_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination,
+                                                                               wait=mock_iptables.wait), exit_code=0)
+                accept_check_command = mock_iptables.set_command(AddFirewallRules.get_wire_root_accept_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination, mock_iptables.uid,
+                                                                                                            wait=mock_iptables.wait), exit_code=0)
+                drop_check_command = mock_iptables.set_command(AddFirewallRules.get_wire_non_root_drop_rule(AddFirewallRules.CHECK_COMMAND, mock_iptables.destination,
+                                                                                                            wait=mock_iptables.wait), exit_code=2)
 
-        mock_run.assert_has_calls([
-            call(osutil.FIREWALL_DROP.format(wait, "C", dst), chk_err=False),
-            call(osutil.FIREWALL_ACCEPT.format(wait, "A", dst, uid))
-        ])
-        mock_output.assert_has_calls([
-            call(osutil.IPTABLES_VERSION)
-        ])
-        self.assertFalse(osutil._enable_firewall)
+                success, _ = osutil.DefaultOSUtil().enable_firewall(dst_ip=mock_iptables.destination, uid=mock_iptables.uid)
 
-    @patch('azurelinuxagent.common.utils.shellutil.run_get_output')
-    @patch('azurelinuxagent.common.utils.shellutil.run')
-    def test_enable_firewall_checks_for_invalid_iptables_options(self, mock_run, mock_output):
-        osutil._enable_firewall = True
-        util = osutil.DefaultOSUtil()
+                delete_conntrack_accept_command = TestOSUtil._command_to_string(osutil.get_firewall_delete_conntrack_accept_command(mock_iptables.wait, mock_iptables.destination))
+                delete_accept_tcp_rule = TestOSUtil._command_to_string(osutil.get_delete_accept_tcp_rule(mock_iptables.wait, mock_iptables.destination))
+                delete_owner_accept_command = TestOSUtil._command_to_string(osutil.get_firewall_delete_owner_accept_command(mock_iptables.wait, mock_iptables.destination, mock_iptables.uid))
+                delete_conntrack_drop_command = TestOSUtil._command_to_string(osutil.get_firewall_delete_conntrack_drop_command(mock_iptables.wait, mock_iptables.destination))
 
-        dst = '1.2.3.4'
-        version = "iptables v{0}".format(osutil.IPTABLES_LOCKING_VERSION)
-        wait = "-w"
+                self.assertFalse(success, "Enable firewall should have failed")
+                self.assertEqual(len(mock_iptables.command_calls), 7, "Incorrect number of calls to iptables: [{0}]". format(mock_iptables.command_calls))
+                self.assertEqual(mock_iptables.command_calls[0], tcp_check_command, "The first command should check the tcp rule: {0}".format(mock_iptables.command_calls[0]))
+                self.assertEqual(mock_iptables.command_calls[1], accept_check_command, "The second command should check the accept rule: {0}".format(mock_iptables.command_calls[1]))
+                self.assertEqual(mock_iptables.command_calls[2], drop_check_command, "The third command should check the drop rule: {0}".format(mock_iptables.command_calls[2]))
+                self.assertEqual(mock_iptables.command_calls[3], delete_conntrack_accept_command, "The fourth command should delete the conntrack accept rule: {0}".format(mock_iptables.command_calls[3]))
+                self.assertEqual(mock_iptables.command_calls[4], delete_accept_tcp_rule,
+                                 "The fifth command should delete the dns tcp accept rule: {0}".format(
+                                     mock_iptables.command_calls[4]))
+                self.assertEqual(mock_iptables.command_calls[5], delete_owner_accept_command, "The sixth command should delete the owner accept rule: {0}".format(mock_iptables.command_calls[5]))
+                self.assertEqual(mock_iptables.command_calls[6], delete_conntrack_drop_command, "The seventh command should delete the conntrack accept rule : {0}".format(mock_iptables.command_calls[6]))
 
-        # iptables uses the following exit codes
-        #  0 - correct function
-        #  1 - other errors
-        #  2 - errors which appear to be caused by invalid or abused command
-        #      line parameters
-        mock_run.side_effect = [2]
-        mock_output.return_value = (0, version)
+                self.assertFalse(osutil._enable_firewall)
 
-        self.assertFalse(util.enable_firewall(dst_ip='1.2.3.4', uid=42))
-        self.assertFalse(osutil._enable_firewall)
+    def test_enable_firewall_skips_if_disabled(self):
 
-        mock_run.assert_has_calls([
-            call(osutil.FIREWALL_DROP.format(wait, "C", dst), chk_err=False),
-        ])
-        mock_output.assert_has_calls([
-            call(osutil.IPTABLES_VERSION)
-        ])
+        with TestOSUtil._mock_iptables() as mock_iptables:
+            with patch.object(osutil, '_enable_firewall', False):
+                success, _ = osutil.DefaultOSUtil().enable_firewall(dst_ip=mock_iptables.destination, uid=mock_iptables.uid)
 
-    @patch('os.getuid', return_value=42)
-    @patch('azurelinuxagent.common.utils.shellutil.run_get_output')
-    @patch('azurelinuxagent.common.utils.shellutil.run')
-    def test_enable_firewall_skips_if_disabled(self, mock_run, mock_output, mock_uid):
-        osutil._enable_firewall = False
-        util = osutil.DefaultOSUtil()
+                self.assertFalse(success, "The firewall should not have been disabled")
+                self.assertEqual(len(mock_iptables.command_calls), 0, "iptables should not have been invoked: [{0}]". format(mock_iptables.command_calls))
 
-        dst = '1.2.3.4'
-        uid = 42
-        version = "iptables v{0}".format(osutil.IPTABLES_LOCKING_VERSION)
+                self.assertFalse(osutil._enable_firewall)
 
-        mock_run.side_effect = [1, 0, 0]
-        mock_output.side_effect = [(0, version), (0, "Output")]
-        self.assertFalse(util.enable_firewall(dst_ip=dst, uid=uid))
+    def test_remove_firewall(self):
 
-        mock_run.assert_not_called()
-        mock_output.assert_not_called()
-        mock_uid.assert_not_called()
-        self.assertFalse(osutil._enable_firewall)
+        with TestOSUtil._mock_iptables() as mock_iptables:
+            with patch.object(osutil, '_enable_firewall', True):
+                delete_commands = {}
 
-    @patch('os.getuid', return_value=42)
-    @patch('azurelinuxagent.common.utils.shellutil.run_get_output')
-    @patch('azurelinuxagent.common.utils.shellutil.run')
-    def test_remove_firewall(self, mock_run, mock_output, mock_uid):
-        osutil._enable_firewall = True
-        util = osutil.DefaultOSUtil()
+                def mock_popen(command, *args, **kwargs):
+                    command_string = TestOSUtil._command_to_string(command)
+                    if AddFirewallRules.DELETE_COMMAND in command_string:
+                        # The agent invokes the delete commands continuously until they return 1 to indicate the rules has been removed
+                        # The mock returns 0 (success) the first time it is invoked and 1 (rule does not exist) thereafter
+                        if command_string not in delete_commands:
+                            exit_code = 0
+                            delete_commands[command_string] = 1
+                        else:
+                            exit_code = 1
+                            delete_commands[command_string] += 1
 
-        dst = '1.2.3.4'
-        uid = 42
-        version = "iptables v{0}".format(osutil.IPTABLES_LOCKING_VERSION)
-        wait = "-w"
+                        command = "echo '' && exit {0}".format(exit_code)
+                        kwargs["shell"] = True
+                    return mock_popen.original(command, *args, **kwargs)
+                mock_popen.original = subprocess.Popen
 
-        mock_run.side_effect = [0, 1, 0, 1, 0, 1]
-        mock_output.side_effect = [(0, version), (0, "Output")]
-        self.assertTrue(util.remove_firewall(dst, uid))
+                with patch("azurelinuxagent.ga.cgroupapi.subprocess.Popen", side_effect=mock_popen):
+                    success = osutil.DefaultOSUtil().remove_firewall(mock_iptables.destination, mock_iptables.uid, mock_iptables.wait)
 
-        mock_run.assert_has_calls([
-            # delete rules < 2.2.26
-            call(osutil.FIREWALL_DELETE_CONNTRACK_ACCEPT.format(wait, dst), chk_err=False),
-            call(osutil.FIREWALL_DELETE_CONNTRACK_ACCEPT.format(wait, dst), chk_err=False),
-            call(osutil.FIREWALL_DELETE_OWNER_ACCEPT.format(wait, dst, uid), chk_err=False),
-            call(osutil.FIREWALL_DELETE_OWNER_ACCEPT.format(wait, dst, uid), chk_err=False),
+                    delete_conntrack_accept_command = TestOSUtil._command_to_string(osutil.get_firewall_delete_conntrack_accept_command(mock_iptables.wait, mock_iptables.destination))
+                    delete_accept_tcp_rule = TestOSUtil._command_to_string(
+                        osutil.get_delete_accept_tcp_rule(mock_iptables.wait, mock_iptables.destination))
+                    delete_owner_accept_command = TestOSUtil._command_to_string(osutil.get_firewall_delete_owner_accept_command(mock_iptables.wait, mock_iptables.destination, mock_iptables.uid))
+                    delete_conntrack_drop_command = TestOSUtil._command_to_string(osutil.get_firewall_delete_conntrack_drop_command(mock_iptables.wait, mock_iptables.destination))
 
-            # delete rules >= 2.2.26
-            call(osutil.FIREWALL_DELETE_CONNTRACK_DROP.format(wait, dst), chk_err=False),
-            call(osutil.FIREWALL_DELETE_CONNTRACK_DROP.format(wait, dst), chk_err=False),
-        ])
-        mock_output.assert_has_calls([
-            call(osutil.IPTABLES_VERSION)
-        ])
-        self.assertTrue(osutil._enable_firewall)
+                    self.assertTrue(success, "Removing the firewall should have succeeded")
+                    self.assertEqual(len(delete_commands), 4, "Expected 4 delete commands: [{0}]".format(delete_commands))
+                    # delete rules < 2.2.26
+                    self.assertIn(delete_accept_tcp_rule, delete_commands, "The delete dns tcp accept command was not executed")
+                    self.assertEqual(delete_commands[delete_accept_tcp_rule], 2, "The delete dns tcp accept command should have been executed twice")
+                    self.assertIn(delete_conntrack_accept_command, delete_commands, "The delete conntrack accept command was not executed")
+                    self.assertEqual(delete_commands[delete_conntrack_accept_command], 2, "The delete conntrack accept command should have been executed twice")
+                    self.assertIn(delete_owner_accept_command, delete_commands, "The delete owner accept command was not executed")
+                    self.assertEqual(delete_commands[delete_owner_accept_command], 2, "The delete owner accept command should have been executed twice")
+                    # delete rules >= 2.2.26
+                    self.assertIn(delete_conntrack_drop_command, delete_commands, "The delete conntrack drop command was not executed")
+                    self.assertEqual(delete_commands[delete_conntrack_drop_command], 2, "The delete conntrack drop command should have been executed twice")
 
-    @patch('os.getuid', return_value=42)
-    @patch('azurelinuxagent.common.utils.shellutil.run_get_output')
-    @patch('azurelinuxagent.common.utils.shellutil.run')
-    def test_remove_firewall_does_not_repeat(self, mock_run, mock_output, _):
-        osutil._enable_firewall = True
-        util = osutil.DefaultOSUtil()
+                    self.assertTrue(osutil._enable_firewall)
 
-        dst_ip='1.2.3.4'
-        uid=42
-        version = "iptables v{0}".format(osutil.IPTABLES_LOCKING_VERSION)
-        wait = "-w"
+    def test_remove_firewall_should_not_retry_invalid_rule(self):
 
-        mock_run.side_effect = [2]
-        mock_output.side_effect = [(0, version), (1, "Output")]
-        self.assertFalse(util.remove_firewall(dst_ip, uid))
+        with TestOSUtil._mock_iptables() as mock_iptables:
+            with patch.object(osutil, '_enable_firewall', True):
+                command = osutil.get_firewall_delete_conntrack_accept_command(mock_iptables.wait, mock_iptables.destination)
+                # Note that the command is actually a valid rule, but we use the mock to report it as invalid (exit code 2)
+                delete_conntrack_accept_command = mock_iptables.set_command(command, exit_code=2)
 
-        mock_run.assert_has_calls([
-            call(osutil.FIREWALL_DELETE_CONNTRACK_ACCEPT.format(wait, dst_ip), chk_err=False),
-        ])
-        mock_output.assert_has_calls([
-            call(osutil.IPTABLES_VERSION)
-        ])
-        self.assertFalse(osutil._enable_firewall)
+                success = osutil.DefaultOSUtil().remove_firewall(mock_iptables.destination, mock_iptables.uid, mock_iptables.wait)
 
-        self.assertTrue(mock_run.call_count == 1)
-        self.assertTrue(mock_output.call_count == 1)
+                self.assertFalse(success, "Removing the firewall should not have succeeded")
+                self.assertEqual(len(mock_iptables.command_calls), 1, "Expected a single call to iptables: [{0}]". format(mock_iptables.command_calls))
+                self.assertEqual(mock_iptables.command_calls[0], delete_conntrack_accept_command, "Expected call to delete conntrack accept command: {0}".format(mock_iptables.command_calls[0]))
 
-        self.assertFalse(util.remove_firewall())
-        self.assertFalse(util.remove_firewall())
+                self.assertFalse(osutil._enable_firewall)
 
-        self.assertTrue(mock_run.call_count == 1)
-        self.assertTrue(mock_output.call_count == 1)
-
-    @skip_if_predicate_true(running_under_travis, "The ip command isn't available in Travis")
+    @skip_if_predicate_true(is_python_version_26_or_34, "Disabled on Python 2.6 and 3.4, they run on containers where the OS commands needed by the test are not present.")
     def test_get_nic_state(self):
         state = osutil.DefaultOSUtil().get_nic_state()
         self.assertNotEqual(state, {})
@@ -916,13 +975,38 @@ Chain OUTPUT (policy ACCEPT 104 packets, 43628 bytes)
         another_state[name].add_ipv4("xyzzy")
         self.assertNotEqual(state, another_state)
 
+        as_string = osutil.DefaultOSUtil().get_nic_state(as_string=True)
+        self.assertNotEqual(as_string, '')
+
+    def test_get_used_and_available_system_memory(self):
+        memory_table = "\
+              total        used        free      shared  buff/cache   available \n\
+Mem:     8340144128   619352064  5236809728     1499136  2483982336  7426314240   \n\
+Swap:             0           0           0   \n"
+        with patch.object(shellutil, 'run_command', return_value=memory_table):
+            used_mem, available_mem = osutil.DefaultOSUtil().get_used_and_available_system_memory()
+
+        self.assertEqual(used_mem, 619352064/(1024**2), "The value didn't match")
+        self.assertEqual(available_mem, 7426314240/(1024**2), "The value didn't match")
+
+    def test_get_used_and_available_system_memory_error(self):
+        msg = 'message'
+        exception = shellutil.CommandError("free -d", 1, "", msg)
+
+        with patch.object(shellutil, 'run_command',
+                          side_effect=exception) as patch_run:
+            with self.assertRaises(shellutil.CommandError) as context_manager:
+                osutil.DefaultOSUtil().get_used_and_available_system_memory()
+            self.assertEqual(patch_run.call_count, 1)
+            self.assertEqual(context_manager.exception.returncode, 1)
+
     def test_get_dhcp_pid_should_return_a_list_of_pids(self):
         osutil_get_dhcp_pid_should_return_a_list_of_pids(self, osutil.DefaultOSUtil())
 
     def test_get_dhcp_pid_should_return_an_empty_list_when_the_dhcp_client_is_not_running(self):
         original_run_command = shellutil.run_command
 
-        def mock_run_command(cmd):
+        def mock_run_command(cmd):  # pylint: disable=unused-argument
             return original_run_command(["pidof", "non-existing-process"])
 
         with patch("azurelinuxagent.common.utils.shellutil.run_command", side_effect=mock_run_command):
@@ -936,10 +1020,10 @@ Chain OUTPUT (policy ACCEPT 104 packets, 43628 bytes)
     @patch('os.path.exists', return_value=True)
     def test_device_for_ide_port_gen1_success(
             self,
-            os_path_exists,
-            os_listdir,
-            fileutil_read_file,
-            os_walk):
+            os_path_exists,  # pylint: disable=unused-argument
+            os_listdir,  # pylint: disable=unused-argument
+            fileutil_read_file,  # pylint: disable=unused-argument
+            os_walk):  # pylint: disable=unused-argument
         dev = osutil.DefaultOSUtil().device_for_ide_port(1)
         self.assertEqual(dev, 'sdb', 'The returned device should be the resource disk')
 
@@ -949,10 +1033,10 @@ Chain OUTPUT (policy ACCEPT 104 packets, 43628 bytes)
     @patch('os.path.exists', return_value=True)
     def test_device_for_ide_port_gen2_success(
             self,
-            os_path_exists,
-            os_listdir,
-            fileutil_read_file,
-            os_walk):
+            os_path_exists,  # pylint: disable=unused-argument
+            os_listdir,  # pylint: disable=unused-argument
+            fileutil_read_file,  # pylint: disable=unused-argument
+            os_walk):  # pylint: disable=unused-argument
         dev = osutil.DefaultOSUtil().device_for_ide_port(1)
         self.assertEqual(dev, 'sdb', 'The returned device should be the resource disk')
 
@@ -960,10 +1044,11 @@ Chain OUTPUT (policy ACCEPT 104 packets, 43628 bytes)
     @patch('os.path.exists', return_value=True)
     def test_device_for_ide_port_none(
             self,
-            os_path_exists,
-            os_listdir):
+            os_path_exists,  # pylint: disable=unused-argument
+            os_listdir):  # pylint: disable=unused-argument
         dev = osutil.DefaultOSUtil().device_for_ide_port(1)
         self.assertIsNone(dev, 'None should be returned if no resource disk found')
+
 
 def osutil_get_dhcp_pid_should_return_a_list_of_pids(test_instance, osutil_instance):
     """
@@ -976,13 +1061,64 @@ def osutil_get_dhcp_pid_should_return_a_list_of_pids(test_instance, osutil_insta
     """
     original_run_command = shellutil.run_command
 
-    def mock_run_command(cmd):
+    def mock_run_command(cmd):  # pylint: disable=unused-argument
         return original_run_command(["pidof", "pidof"])
 
     with patch("azurelinuxagent.common.utils.shellutil.run_command", side_effect=mock_run_command):
         pid = osutil_instance.get_dhcp_pid()
 
     test_instance.assertTrue(len(pid) != 0, "get_dhcp_pid did not return a PID")
+
+
+class TestGetPublishedHostname(AgentTestCase):
+    def setUp(self):
+        AgentTestCase.setUp(self)
+        self.__published_hostname = os.path.join(self.tmp_dir, "published_hostname")
+        self.__patcher = patch('azurelinuxagent.common.osutil.default.conf.get_published_hostname', return_value=self.__published_hostname)
+        self.__patcher.start()
+
+    def tearDown(self):
+        self.__patcher.stop()
+        AgentTestCase.tearDown(self)
+
+    def __get_published_hostname_contents(self):
+        with open(self.__published_hostname, "r") as file_:
+            return file_.read()
+
+    def test_get_hostname_record_should_create_published_hostname(self):
+        actual = osutil.DefaultOSUtil().get_hostname_record()
+
+        expected = socket.gethostname()
+        self.assertEqual(expected, actual, "get_hostname_record returned an incorrect hostname")
+        self.assertTrue(os.path.exists(self.__published_hostname), "The published_hostname file was not created")
+        self.assertEqual(expected, self.__get_published_hostname_contents(), "get_hostname_record returned an incorrect hostname")
+
+    def test_get_hostname_record_should_use_existing_published_hostname(self):
+        expected = "a-sample-hostname-used-for-testing"
+        with open(self.__published_hostname, "w") as file_:
+            file_.write(expected)
+
+        actual = osutil.DefaultOSUtil().get_hostname_record()
+
+        self.assertEqual(expected, actual, "get_hostname_record returned an incorrect hostname")
+        self.assertEqual(expected, self.__get_published_hostname_contents(), "get_hostname_record returned an incorrect hostname")
+
+    def test_get_hostname_record_should_initialize_the_host_name_using_cloud_init_info(self):
+        with MockEnvironment(self.tmp_dir, files=[('/var/lib/cloud/data/set-hostname', os.path.join(data_dir, "cloud-init", "set-hostname"))]):
+            actual = osutil.DefaultOSUtil().get_hostname_record()
+
+        expected = "a-sample-set-hostname"
+        self.assertEqual(expected, actual, "get_hostname_record returned an incorrect hostname")
+        self.assertEqual(expected, self.__get_published_hostname_contents(), "get_hostname_record returned an incorrect hostname")
+
+    def test_get_password_hash(self):
+        with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'test_passwords.txt'), 'rb') as in_file:
+            for data in in_file:
+                # Remove bom on bytes data before it is converted into string.
+                data = textutil.remove_bom(data)
+                data = ustr(data, encoding='utf-8')
+                password_hash = osutil.DefaultOSUtil.gen_password_hash(data, 6, 10)
+                self.assertNotEqual(None, password_hash)
 
 
 if __name__ == '__main__':

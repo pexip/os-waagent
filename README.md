@@ -1,31 +1,15 @@
+
 # Microsoft Azure Linux Agent
 
-## Develop branch status
+## Linux distributions support
 
-[![Travis CI](https://travis-ci.org/Azure/WALinuxAgent.svg?branch=develop)](https://travis-ci.org/Azure/WALinuxAgent/branches)
-[![CodeCov](https://codecov.io/gh/Azure/WALinusAgent/branch/develop/graph/badge.svg)](https://codecov.io/gh/Azure/WALinuxAgent/branch/develop)
+Our daily automation tests most of the [Linux distributions supported by Azure](https://docs.microsoft.com/en-us/azure/virtual-machines/linux/endorsed-distros); the Agent can be
+used on other distributions as well, but development, testing and support for those are done by the open source community.
 
-Each badge below represents our basic validation tests for an image, which are executed several times each day. These include provisioning, user account, disk, extension and networking scenarios.
+Testing is done using the develop branch, which can be unstable. For a stable build please use the master branch instead.
 
-Note: These badges represent testing to our develop branch which might not be stable. For a stable build please use master branch instead. 
+[![CodeCov](https://codecov.io/gh/Azure/WALinuxAgent/branch/develop/graph/badge.svg)](https://codecov.io/gh/Azure/WALinuxAgent/branch/develop)
 
-Image | Status |
-------|--------|
-Canonical UbuntuServer 14.04.5-LTS|![badge](https://dcrbadges.blob.core.windows.net/scenarios/Canonical_UbuntuServer_14.04.5-LTS__agent--bvt.svg)
-Canonical UbuntuServer 14.04.5-DAILY-LTS|![badge](https://dcrbadges.blob.core.windows.net/scenarios/Canonical_UbuntuServer_14.04.5-DAILY-LTS__agent--bvt.svg)
-Canonical UbuntuServer 16.04-LTS|![badge](https://dcrbadges.blob.core.windows.net/scenarios/Canonical_UbuntuServer_16.04-LTS__agent--bvt.svg)
-Canonical UbuntuServer 16.04-DAILY-LTS|![badge](https://dcrbadges.blob.core.windows.net/scenarios/Canonical_UbuntuServer_16.04-DAILY-LTS__agent--bvt.svg)
-Canonical UbuntuServer 18.04-LTS|![badge](https://dcrbadges.blob.core.windows.net/scenarios/Canonical_UbuntuServer_18.04-LTS__agent--bvt.svg)
-Canonical UbuntuServer 18.04-DAILY-LTS|![badge](https://dcrbadges.blob.core.windows.net/scenarios/Canonical_UbuntuServer_18.04-DAILY-LTS__agent--bvt.svg)
-Credativ Debian 8|![badge](https://dcrbadges.blob.core.windows.net/scenarios/Credativ_Debian_8__agent--bvt.svg)
-Credativ Debian 8-DAILY|![badge](https://dcrbadges.blob.core.windows.net/scenarios/Credativ_Debian_8-DAILY__agent--bvt.svg)
-Credativ Debian 9|![badge](https://dcrbadges.blob.core.windows.net/scenarios/Credativ_Debian_9__agent--bvt.svg)
-Credativ Debian 9-DAILY|![badge](https://dcrbadges.blob.core.windows.net/scenarios/Credativ_Debian_9-DAILY__agent--bvt.svg)
-OpenLogic CentOS 6.9|![badge](https://dcrbadges.blob.core.windows.net/scenarios/OpenLogic_CentOS_6.9__agent--bvt.svg)
-OpenLogic CentOS 7.4|![badge](https://dcrbadges.blob.core.windows.net/scenarios/OpenLogic_CentOS_7.4__agent--bvt.svg)
-RedHat RHEL 6.9|![badge](https://dcrbadges.blob.core.windows.net/scenarios/RedHat_RHEL_6.9__agent--bvt.svg)
-RedHat RHEL 7-RAW|![badge](https://dcrbadges.blob.core.windows.net/scenarios/RedHat_RHEL_7-RAW__agent--bvt.svg)
-SUSE SLES 12-SP3|![badge](https://dcrbadges.blob.core.windows.net/scenarios/SUSE_SLES_12-SP3__agent--bvt.svg)
 
 ## Introduction
 
@@ -49,7 +33,6 @@ functionality for Linux IaaS deployments:
 
 * Kernel
   * Configure virtual NUMA (disable for kernel <2.6.37)
-  * Consume Hyper-V entropy for /dev/random
   * Configure SCSI timeouts for the root device (which could be remote)
 
 * Diagnostics
@@ -75,17 +58,39 @@ The information flow from the platform to the agent occurs via two channels:
 * A TCP endpoint exposing a REST API used to obtain deployment and topology
   configuration.
 
-The agent will use an HTTP proxy if provided via the `http_proxy` (for `http` requests) or
-`https_proxy` (for `https` requests) environment variables. The `HttpProxy.Host` and
-`HttpProxy.Port` configuration variables (see below), if used, will override the environment
-settings. Due to limitations of Python, the agent *does not* support HTTP proxies requiring
-authentication.
+### HTTP Proxy
+The Agent will use an HTTP proxy if provided via the `http_proxy` (for `http` requests) or
+`https_proxy` (for `https` requests) environment variables. Due to limitations of Python, 
+the agent *does not* support HTTP proxies requiring authentication. 
+
+Similarly, the Agent will bypass the proxy if the environment variable `no_proxy` is set.
+
+Note that the way to define those environment variables for the Agent service varies across different distros. For distros
+that use systemd, a common approach is to use Environment or EnvironmentFile in the [Service] section of the service 
+definition, for example using an override or a drop-in file (see "systemctl edit" for overrides).
+
+Example
+```bash
+    # cat /etc/systemd/system/walinuxagent.service.d/http-proxy.conf
+    [Service]
+    Environment="http_proxy=http://proxy.example.com:80/"
+    Environment="https_proxy=http://proxy.example.com:80/"
+    #
+```
+
+The Agent passes its environment to the VM Extensions it executes, including `http_proxy` and `https_proxy`, so defining
+a proxy for the Agent will also define it for the VM Extensions.
+
+
+The [`HttpProxy.Host` and `HttpProxy.Port`](#httpproxyhost-httpproxyport) configuration variables, if used, override 
+the environment settings. Note that this configuration variables are local to the Agent process and are not passed to
+VM Extensions.
 
 ## Requirements
 
 The following systems have been tested and are known to work with the Azure
 Linux Agent.  Please note that this list may differ from the official list
-of supported systems on the Microsoft Azure Platform as described [here](http://support.microsoft.com/kb/2805216).
+of supported systems on the Microsoft Azure Platform as described [here](https://docs.microsoft.com/en-us/azure/virtual-machines/linux/endorsed-distros).
 
 Waagent depends on some system packages in order to function properly:
 
@@ -95,18 +100,26 @@ Waagent depends on some system packages in order to function properly:
 * Filesystem utilities: sfdisk, fdisk, mkfs, parted
 * Password tools: chpasswd, sudo
 * Text processing tools: sed, grep
-* Network tools: ip-route
+* Network tools: ip-route, iptables
 
 ## Installation
 
-Installation via your distribution's package repository is preferred.
-You can also customize your own RPM or DEB packages using the configuration
-samples provided (see deb and rpm sections below).
+Installing via your distribution's package repository is the only method that is supported.
 
-For more advanced installation options, such as installing to custom locations or prefixes, you can use **setuptools** to install from source by running:
+You can install from source for more advanced options, such as installing to a custom location or creating 
+custom images. Installing from source, though, may override customizations done to the Agent by your 
+distribution, and is meant only for advanced users. We provide very limited support for this method.
+
+To install from source, you can use **setuptools**:
 
 ```bash
     sudo python setup.py install --register-service
+```
+
+For Python 3, use:
+
+```bash
+    sudo python3 setup.py install --register-service
 ```
 
 You can view more installation options by running:
@@ -117,11 +130,18 @@ You can view more installation options by running:
 
 The agent's log file is kept at `/var/log/waagent.log`.
 
+Lastly, you can also customize your own RPM or DEB packages using the configuration
+samples provided in the deb and rpm sections below. This method is also meant for advanced users and we
+provide very limited support for it.
+
+
 ## Upgrade
 
-Upgrading via your distribution's package repository is strongly preferred.
+Upgrading via your distribution's package repository or using automatic updates are the only supported
+methods. More information can be found here: [Update Linux Agent](https://learn.microsoft.com/en-us/azure/virtual-machines/extensions/update-linux-agent) 
 
-If upgrading manually, same with installation above by running:
+To upgrade the Agent from source, you can use **setuptools**. Upgrading from source is meant for advanced 
+users and we provide very limited support for it.
 
 ```bash
     sudo python setup.py install --force
@@ -177,6 +197,8 @@ For CoreOS, use:
 
 `-start`: Run waagent as a background process
 
+`-collect-logs [-full]`: Runs the log collector utility that collects relevant agent logs for debugging and stores them in the agent folder on disk. Exact location will be shown when run. Use flag `-full` for more exhaustive log collection. 
+
 ## Configuration
 
 A configuration file (/etc/waagent.conf) controls the actions of waagent. Blank lines and lines whose first character is a `#` are ignored (end-of-line comments are *not* supported).
@@ -185,6 +207,7 @@ A sample configuration file is shown below:
 
 ```yml
 Extensions.Enabled=y
+Extensions.GoalStatePeriod=6
 Provisioning.Agent=auto
 Provisioning.DeleteRootPassword=n
 Provisioning.RegenerateSshHostKeyPair=y
@@ -202,6 +225,8 @@ ResourceDisk.EnableSwap=n
 ResourceDisk.EnableSwapEncryption=n
 ResourceDisk.SwapSizeMB=0
 Logs.Verbose=n
+Logs.Collect=y
+Logs.CollectPeriod=3600
 OS.AllowHTTP=n
 OS.RootDeviceScsiTimeout=300
 OS.EnableFIPS=n
@@ -210,8 +235,6 @@ OS.SshClientAliveInterval=180
 OS.SshDir=/etc/ssh
 HttpProxy.Host=None
 HttpProxy.Port=None
-CGroups.EnforceLimits=y
-CGroups.Excluded=customscript,runcommand
 ```
 
 The various configuration options are described in detail below. Configuration
@@ -238,6 +261,75 @@ without the agent. In order to do that, the `provisionVMAgent` flag must be set 
 provisioning time, via whichever API is being used. We will provide more details on
 this on our wiki when it is generally available. 
 
+#### __Extensions.WaitForCloudInit__
+
+_Type: Boolean_  
+_Default: n_
+
+Waits for cloud-init to complete (cloud-init status --wait) before executing VM extensions.
+
+Both cloud-init and VM extensions are common ways to customize a VM during initial deployment. By
+default, the agent will start executing extensions while cloud-init may still be in the 'config' 
+stage and won't wait for the 'final' stage to complete. Cloud-init and extensions may execute operations
+that conflict with each other (for example, both of them may try to install packages). Setting this option
+to 'y' ensures that VM extensions are executed only after cloud-init has completed all its stages.
+
+Note that using this option requires creating a custom image with the value of this option set to 'y', in
+order to ensure that the wait is performed during the initial deployment of the VM.
+
+#### __Extensions.WaitForCloudInitTimeout__
+
+_Type: Integer_  
+_Default: 3600_
+
+Timeout in seconds for the Agent to wait on cloud-init. If the timeout elapses, the Agent will continue 
+executing VM extensions. See Extensions.WaitForCloudInit for more details. 
+
+#### __Extensions.GoalStatePeriod__
+
+_Type: Integer_  
+_Default: 6_
+
+How often to poll for new goal states (in seconds) and report the status of the VM
+and extensions. Goal states describe the desired state of the extensions on the VM.
+
+_Note_: setting up this parameter to more than a few minutes can make the state of
+the VM be reported as unresponsive/unavailable on the Azure portal. Also, this 
+setting affects how fast the agent starts executing extensions. 
+
+#### __AutoUpdate.UpdateToLatestVersion__
+
+_Type: Boolean_
+_Default: y_
+
+Enables auto-update of the Extension Handler. The Extension Handler is responsible
+for managing extensions and reporting VM status. The core functionality of the agent
+is contained in the Extension Handler, and we encourage users to enable this option
+in order to maintain an up to date version.
+ 
+When this option is enabled, the Agent will install new versions when they become
+available. When disabled, the Agent will not install any new versions, but it will use
+the most recent version already installed on the VM.
+
+_Notes_:
+1. This option was added on version 2.10.0.8 of the Agent. For previous versions, see AutoUpdate.Enabled.
+2. If both options are specified in waagent.conf, AutoUpdate.UpdateToLatestVersion overrides the value set for AutoUpdate.Enabled.
+3. Changing config option requires a service restart to pick up the updated setting.
+
+For more information on the agent version, see our [FAQ](https://github.com/Azure/WALinuxAgent/wiki/FAQ#what-does-goal-state-agent-mean-in-waagent---version-output). <br/>
+For more information on the agent update, see our [FAQ](https://github.com/Azure/WALinuxAgent/wiki/FAQ#how-auto-update-works-for-extension-handler). <br/>
+For more information on the AutoUpdate.UpdateToLatestVersion vs AutoUpdate.Enabled, see our [FAQ](https://github.com/Azure/WALinuxAgent/wiki/FAQ#autoupdateenabled-vs-autoupdateupdatetolatestversion). <br/>
+
+#### __AutoUpdate.Enabled__
+
+_Type: Boolean_  
+_Default: y_
+
+Enables auto-update of the Extension Handler. This flag is supported for legacy reasons and we strongly recommend using AutoUpdate.UpdateToLatestVersion instead. 
+The difference between these 2 flags is that, when set to 'n', AutoUpdate.Enabled will use the version of the Extension Handler that is pre-installed on the image, while AutoUpdate.UpdateToLatestVersion will use the most recent version that has already been installed on the VM (via auto-update).
+
+On most distros the default value is 'y'.
+
 #### __Provisioning.Agent__
 
 _Type: String_
@@ -261,7 +353,22 @@ _Note_: This configuration option has been removed and has no effect. waagent
 now auto-detects cloud-init as a provisioning agent (with an option to override
 with `Provisioning.Agent`).
 
-#### __Provisioning.UseCloudInit__ (*removed in 2.2.45*)
+#### __Provisioning.MonitorHostName__
+
+_Type: Boolean_ 
+_Default: n_
+
+Monitor host name changes and publish changes via DHCP requests.
+
+#### __Provisioning.MonitorHostNamePeriod__
+
+_Type: Integer_ 
+_Default: 30_
+
+How often to monitor host name changes (in seconds). This setting is ignored if
+MonitorHostName is not set.
+
+#### __Provisioning.UseCloudInit__
 
 _Type: Boolean_ 
 _Default: n_
@@ -414,6 +521,25 @@ _Default: n_
 If set, log verbosity is boosted. Waagent logs to /var/log/waagent.log and
 leverages the system logrotate functionality to rotate logs.
 
+
+#### __Logs.Collect__
+
+_Type: Boolean_  
+_Default: y_
+
+If set, agent logs will be periodically collected and uploaded to a secure location for improved supportability.
+
+NOTE: This feature relies on the agent's resource usage features (cgroups); this flag will not take effect on any distro not supported.
+
+#### __Logs.CollectPeriod__
+
+_Type: Integer_  
+_Default: 3600_
+
+This configures how frequently to collect and upload logs. Default is each hour.
+
+NOTE: This only takes effect if the Logs.Collect option is enabled.
+
 #### __OS.AllowHTTP__
 
 _Type: Boolean_  
@@ -442,6 +568,21 @@ OpenSSL commands. This signals OpenSSL to use any installed FIPS-compliant libra
 Note that the agent itself has no FIPS-specific code. _If no FIPS-compliant certificates are
 installed, then enabling this option will cause all OpenSSL commands to fail._
 
+#### __OS.EnableFirewall__
+
+_Type: Boolean_  
+_Default: n (set to 'y' in waagent.conf)_
+
+Creates firewall rules to allow communication with the VM Host only by the Agent.  
+
+#### __OS.MonitorDhcpClientRestartPeriod__
+
+_Type: Integer_
+_Default: 30_
+
+The agent monitor restarts of the DHCP client and restores network rules when it happens. This
+setting determines how often (in seconds) to monitor for restarts.
+
 #### __OS.RootDeviceScsiTimeout__
 
 _Type: Integer_  
@@ -450,6 +591,14 @@ _Default: 300_
 This configures the SCSI timeout in seconds on the root device. If not set, the
 system defaults are used.
 
+#### __OS.RootDeviceScsiTimeoutPeriod__
+
+_Type: Integer_  
+_Default: 30_
+
+How often to set the SCSI timeout on the root device (in seconds). This setting is
+ignored if RootDeviceScsiTimeout is not set.
+
 #### __OS.OpensslPath__
 
 _Type: String_  
@@ -457,6 +606,13 @@ _Default: None_
 
 This can be used to specify an alternate path for the openssl binary to use for
 cryptographic operations.
+
+#### __OS.RemovePersistentNetRulesPeriod__
+_Type: Integer_  
+_Default: 30_
+
+How often to remove the udev rules for persistent network interface names (75-persistent-net-generator.rules
+and /etc/udev/rules.d/70-persistent-net.rules) (in seconds) 
 
 #### __OS.SshClientAliveInterval__
 
@@ -478,7 +634,7 @@ directory.
 _Type: String_  
 _Default: None_
 
-If set, the agent will use this proxy server to access the internet. These values
+If set, the agent will use this proxy server for HTTP/HTTPS requests. These values
 *will* override the `http_proxy` or `https_proxy` environment variables. Lastly,
 `HttpProxy.Host` is required (if to be used) and `HttpProxy.Port` is optional.
 

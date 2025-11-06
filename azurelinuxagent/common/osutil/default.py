@@ -16,39 +16,52 @@
 # Requires Python 2.6+ and Openssl 1.0+
 #
 
+import array
 import base64
 import datetime
 import errno
 import fcntl
 import glob
+import json
 import multiprocessing
 import os
 import platform
 import pwd
+import random
 import re
 import shutil
 import socket
+import string
 import struct
 import sys
 import time
 from pwd import getpwall
 
-import array
-
-import azurelinuxagent.common.conf as conf
-import azurelinuxagent.common.logger as logger
-import azurelinuxagent.common.utils.fileutil as fileutil
-import azurelinuxagent.common.utils.shellutil as shellutil
-import azurelinuxagent.common.utils.textutil as textutil
 from azurelinuxagent.common.exception import OSUtilError
-from azurelinuxagent.common.future import ustr
+# 'crypt' was removed in Python 3.13; use legacycrypt instead
+if sys.version_info[0] == 3 and sys.version_info[1] >= 13 or sys.version_info[0] > 3:
+    try:
+        from legacycrypt import crypt
+    except ImportError:
+        def crypt(password, salt):
+            raise OSUtilError("Please install the legacycrypt Python module to use this feature.")
+else:
+    from crypt import crypt  # pylint: disable=deprecated-module
+
+from azurelinuxagent.common import conf
+from azurelinuxagent.common import logger
+from azurelinuxagent.common.utils import fileutil
+from azurelinuxagent.common.utils import shellutil
+from azurelinuxagent.common.utils import textutil
+
+from azurelinuxagent.common.future import ustr, array_to_bytes
 from azurelinuxagent.common.utils.cryptutil import CryptUtil
 from azurelinuxagent.common.utils.flexible_version import FlexibleVersion
-from azurelinuxagent.common.utils.networkutil import RouteEntry, NetworkInterfaceCard
+from azurelinuxagent.common.utils.networkutil import RouteEntry, NetworkInterfaceCard, AddFirewallRules
 from azurelinuxagent.common.utils.shellutil import CommandError
 
-__RULES_FILES__ = [ "/lib/udev/rules.d/75-persistent-net-generator.rules",
-                    "/etc/udev/rules.d/70-persistent-net.rules" ]
+__RULES_FILES__ = ["/lib/udev/rules.d/75-persistent-net-generator.rules",
+                   "/etc/udev/rules.d/70-persistent-net.rules"]
 
 """
 Define distro specific behavior. OSUtil class defines default behavior
@@ -56,29 +69,57 @@ for all distros. Each concrete distro classes could overwrite default behavior
 if needed.
 """
 
-IPTABLES_VERSION_PATTERN = re.compile("^[^\d\.]*([\d\.]+).*$")
-IPTABLES_VERSION = "iptables --version"
-IPTABLES_LOCKING_VERSION = FlexibleVersion('1.4.21')
+_IPTABLES_VERSION_PATTERN = re.compile(r"^[^\d\.]*([\d\.]+).*$")
+_IPTABLES_LOCKING_VERSION = FlexibleVersion('1.4.21')
 
-FIREWALL_ACCEPT = "iptables {0} -t security -{1} OUTPUT -d {2} -p tcp -m owner --uid-owner {3} -j ACCEPT"
-# Note:
-# -- Initially "flight" the change to ACCEPT packets and develop a metric baseline
-#    A subsequent release will convert the ACCEPT to DROP
-# FIREWALL_DROP = "iptables {0} -t security -{1} OUTPUT -d {2} -p tcp -m conntrack --ctstate INVALID,NEW -j ACCEPT"
-FIREWALL_DROP = "iptables {0} -t security -{1} OUTPUT -d {2} -p tcp -m conntrack --ctstate INVALID,NEW -j DROP"
-FIREWALL_LIST = "iptables {0} -t security -L -nxv"
-FIREWALL_PACKETS = "iptables {0} -t security -L OUTPUT --zero OUTPUT -nxv"
-FIREWALL_FLUSH = "iptables {0} -t security --flush"
+
+def _add_wait(wait, command):
+    """
+    If 'wait' is True, adds the wait option (-w) to the given iptables command line
+    """
+    if wait:
+        command.insert(1, "-w")
+    return command
+
+
+def get_iptables_version_command():
+    return ["iptables", "--version"]
+
+
+def get_firewall_list_command(wait):
+    return _add_wait(wait, ["iptables", "-t", "security", "-L", "-nxv"])
+
+
+def get_firewall_packets_command(wait):
+    return _add_wait(wait, ["iptables", "-t", "security", "-L", "OUTPUT", "--zero", "OUTPUT", "-nxv"])
+
 
 # Precisely delete the rules created by the agent.
 # this rule was used <= 2.2.25.  This rule helped to validate our change, and determine impact.
-FIREWALL_DELETE_CONNTRACK_ACCEPT = "iptables {0} -t security -D OUTPUT -d {1} -p tcp -m conntrack --ctstate INVALID,NEW -j ACCEPT"
-FIREWALL_DELETE_OWNER_ACCEPT = "iptables {0} -t security -D OUTPUT -d {1} -p tcp -m owner --uid-owner {2} -j ACCEPT"
-FIREWALL_DELETE_CONNTRACK_DROP = "iptables {0} -t security -D OUTPUT -d {1} -p tcp -m conntrack --ctstate INVALID,NEW -j DROP"
+def get_firewall_delete_conntrack_accept_command(wait, destination):
+    return _add_wait(wait,
+                     ["iptables", "-t", "security", AddFirewallRules.DELETE_COMMAND, "OUTPUT", "-d", destination, "-p", "tcp", "-m", "conntrack",
+                      "--ctstate", "INVALID,NEW", "-j", "ACCEPT"])
 
-PACKET_PATTERN = "^\s*(\d+)\s+(\d+)\s+DROP\s+.*{0}[^\d]*$"
+
+def get_delete_accept_tcp_rule(wait, destination):
+    return AddFirewallRules.get_accept_tcp_rule(AddFirewallRules.DELETE_COMMAND, destination, wait=wait)
+
+
+def get_firewall_delete_owner_accept_command(wait, destination, owner_uid):
+    return _add_wait(wait, ["iptables", "-t", "security", AddFirewallRules.DELETE_COMMAND, "OUTPUT", "-d", destination, "-p", "tcp", "-m", "owner",
+                            "--uid-owner", str(owner_uid), "-j", "ACCEPT"])
+
+
+def get_firewall_delete_conntrack_drop_command(wait, destination):
+    return _add_wait(wait,
+                     ["iptables", "-t", "security", AddFirewallRules.DELETE_COMMAND, "OUTPUT", "-d", destination, "-p", "tcp", "-m", "conntrack",
+                      "--ctstate", "INVALID,NEW", "-j", "DROP"])
+
+
+PACKET_PATTERN = r"^\s*(\d+)\s+(\d+)\s+DROP\s+.*{0}[^\d]*$"
 ALL_CPUS_REGEX = re.compile('^cpu .*')
-
+ALL_MEMS_REGEX = re.compile('^Mem.*')
 
 _enable_firewall = True
 
@@ -93,12 +134,11 @@ IOCTL_SIOCGIFFLAGS = 0x8913
 IOCTL_SIOCGIFHWADDR = 0x8927
 IFNAMSIZ = 16
 
-IP_COMMAND_OUTPUT = re.compile('^\d+:\s+(\w+):\s+(.*)$')
-
-BASE_CGROUPS = '/sys/fs/cgroup'
+IP_COMMAND_OUTPUT = re.compile(r'^\d+:\s+(\w+):\s+(.*)$')
 
 STORAGE_DEVICE_PATH = '/sys/bus/vmbus/devices/'
 GEN2_DEVICE_ID = 'f8b3781a-1e82-4818-a1c3-63d806ec15bb'
+
 
 class DefaultOSUtil(object):
     def __init__(self):
@@ -112,30 +152,49 @@ class DefaultOSUtil(object):
     def get_service_name():
         return "waagent"
 
+    @staticmethod
+    def get_systemd_unit_file_install_path():
+        return "/lib/systemd/system"
+
+    @staticmethod
+    def get_agent_bin_path():
+        return "/usr/sbin"
+
+    @staticmethod
+    def get_vm_arch():
+        try:
+            return platform.machine()
+        except Exception as e:
+            logger.warn("Unable to determine cpu architecture: {0}", ustr(e))
+            return "unknown"
+
     def get_firewall_dropped_packets(self, dst_ip=None):
         # If a previous attempt failed, do not retry
-        global _enable_firewall
+        global _enable_firewall  # pylint: disable=W0603
         if not _enable_firewall:
             return 0
 
         try:
             wait = self.get_firewall_will_wait()
 
-            rc, output = shellutil.run_get_output(FIREWALL_PACKETS.format(wait), log_cmd=False, expected_errors=[3])
-            if rc == 3:
-                # Transient error  that we ignore.  This code fires every loop
-                # of the daemon (60m), so we will get the value eventually.
-                return 0
+            try:
+                output = shellutil.run_command(get_firewall_packets_command(wait))
 
-            if rc != 0:
+                pattern = re.compile(PACKET_PATTERN.format(dst_ip))
+                for line in output.split('\n'):
+                    m = pattern.match(line)
+                    if m is not None:
+                        return int(m.group(1))
+
+            except Exception as e:
+                if isinstance(e, CommandError) and (e.returncode == 3 or e.returncode == 4):  # pylint: disable=E1101
+                    # Transient error that we ignore returncode 3. This code fires every loop
+                    # of the daemon (60m), so we will get the value eventually.
+                    # ignore returncode 4 as temporary fix (RULE_REPLACE failed (Invalid argument))
+                    return 0
+                logger.warn("Failed to get firewall packets: {0}", ustr(e))
                 return -1
 
-            pattern = re.compile(PACKET_PATTERN.format(dst_ip))
-            for line in output.split('\n'):
-                m = pattern.match(line)
-                if m is not None:
-                    return int(m.group(1))
-            
             return 0
 
         except Exception as e:
@@ -146,21 +205,22 @@ class DefaultOSUtil(object):
 
     def get_firewall_will_wait(self):
         # Determine if iptables will serialize access
-        rc, output = shellutil.run_get_output(IPTABLES_VERSION)
-        if rc != 0:
-            msg = "Unable to determine version of iptables"
+        try:
+            output = shellutil.run_command(get_iptables_version_command())
+        except Exception as e:
+            msg = "Unable to determine version of iptables: {0}".format(ustr(e))
             logger.warn(msg)
             raise Exception(msg)
 
-        m = IPTABLES_VERSION_PATTERN.match(output)
+        m = _IPTABLES_VERSION_PATTERN.match(output)
         if m is None:
-            msg = "iptables did not return version information"
+            msg = "iptables did not return version information: {0}".format(output)
             logger.warn(msg)
             raise Exception(msg)
 
         wait = "-w" \
-                if FlexibleVersion(m.group(1)) >= IPTABLES_LOCKING_VERSION \
-                else ""
+            if FlexibleVersion(m.group(1)) >= _IPTABLES_LOCKING_VERSION \
+            else ""
         return wait
 
     def _delete_rule(self, rule):
@@ -168,33 +228,29 @@ class DefaultOSUtil(object):
         Continually execute the delete operation until the return
         code is non-zero or the limit has been reached.
         """
-        for i in range(1, 100):
-            rc = shellutil.run(rule, chk_err=False)
-            if rc == 1:
-                return
-            elif rc == 2:
-                raise Exception("invalid firewall deletion rule '{0}'".format(rule))
+        for i in range(1, 100):  # pylint: disable=W0612
+            try:
+                rc = shellutil.run_command(rule)  # pylint: disable=W0612
+            except CommandError as e:
+                if e.returncode == 1:
+                    return
+                if e.returncode == 2:
+                    raise Exception("invalid firewall deletion rule '{0}'".format(rule))
 
-    def remove_firewall(self, dst_ip=None, uid=None):
+    def remove_firewall(self, dst_ip, uid, wait):
         # If a previous attempt failed, do not retry
-        global _enable_firewall
+        global _enable_firewall  # pylint: disable=W0603
         if not _enable_firewall:
             return False
 
         try:
-            if dst_ip is None or uid is None:
-                msg = "Missing arguments to enable_firewall"
-                logger.warn(msg)
-                raise Exception(msg)
-
-            wait = self.get_firewall_will_wait()
-
             # This rule was <= 2.2.25 only, and may still exist on some VMs.  Until 2.2.25
             # has aged out, keep this cleanup in place.
-            self._delete_rule(FIREWALL_DELETE_CONNTRACK_ACCEPT.format(wait, dst_ip))
+            self._delete_rule(get_firewall_delete_conntrack_accept_command(wait, dst_ip))
 
-            self._delete_rule(FIREWALL_DELETE_OWNER_ACCEPT.format(wait, dst_ip, uid))
-            self._delete_rule(FIREWALL_DELETE_CONNTRACK_DROP.format(wait, dst_ip))
+            self._delete_rule(get_delete_accept_tcp_rule(wait, dst_ip))
+            self._delete_rule(get_firewall_delete_owner_accept_command(wait, dst_ip, uid))
+            self._delete_rule(get_firewall_delete_conntrack_drop_command(wait, dst_ip))
 
             return True
 
@@ -205,68 +261,75 @@ class DefaultOSUtil(object):
                         "{0}".format(ustr(e)))
             return False
 
-    def enable_firewall(self, dst_ip=None, uid=None):
-        # If a previous attempt failed, do not retry
-        global _enable_firewall
-        if not _enable_firewall:
-            return False
-
+    def remove_legacy_firewall_rule(self, dst_ip):
+        # This function removes the legacy firewall rule that was added <= 2.2.25.
+        # Not adding the global _enable_firewall check here as this will only be called once per service start and
+        # we dont want the state of this call to affect other iptable calls.
         try:
-            if dst_ip is None or uid is None:
-                msg = "Missing arguments to enable_firewall"
-                logger.warn(msg)
-                raise Exception(msg)
-
             wait = self.get_firewall_will_wait()
 
-            # If the DROP rule exists, make no changes
-            drop_rule = FIREWALL_DROP.format(wait, "C", dst_ip)
-            rc = shellutil.run(drop_rule, chk_err=False)
-            if rc == 0:
-                logger.verbose("Firewall appears established")
-                return True
-            elif rc == 2:
-                self.remove_firewall(dst_ip, uid)
-                msg = "please upgrade iptables to a version that supports the -C option"
-                logger.warn(msg)
-                raise Exception(msg)
+            # This rule was <= 2.2.25 only, and may still exist on some VMs.  Until 2.2.25
+            # has aged out, keep this cleanup in place.
+            self._delete_rule(get_firewall_delete_conntrack_accept_command(wait, dst_ip))
+        except Exception as error:
+            logger.info(
+                "Unable to remove legacy firewall rule, won't try removing it again. Error: {0}".format(ustr(error)))
 
-            # Otherwise, append both rules
-            accept_rule = FIREWALL_ACCEPT.format(wait, "A", dst_ip, uid)
-            drop_rule = FIREWALL_DROP.format(wait, "A", dst_ip)
+    def enable_firewall(self, dst_ip, uid):
+        """
+        It checks if every iptable rule exists and add them if not present. It returns a tuple(enable firewall success status, missing rules array)
+        enable firewall success status: Returns True if every firewall rule exists otherwise False
+        missing rules: array with names of the missing rules ("ACCEPT DNS", "ACCEPT", "DROP")
+        """
+        # If a previous attempt failed, do not retry
+        global _enable_firewall  # pylint: disable=W0603
+        if not _enable_firewall:
+            return False, []
 
-            if shellutil.run(accept_rule) != 0:
-                msg = "Unable to add ACCEPT firewall rule '{0}'".format(
-                    accept_rule)
-                logger.warn(msg)
-                raise Exception(msg)
+        missing_rules = []
 
-            if shellutil.run(drop_rule) != 0:
-                msg = "Unable to add DROP firewall rule '{0}'".format(
-                    drop_rule)
-                logger.warn(msg)
-                raise Exception(msg)
+        try:
+            wait = self.get_firewall_will_wait()
 
-            logger.info("Successfully added Azure fabric firewall rules")
+            # check every iptable rule and delete others if any rule is missing
+            #   and append every iptable rule to the end of the chain.
+            try:
+                missing_rules.extend(AddFirewallRules.get_missing_iptables_rules(wait, dst_ip, uid))
+                if len(missing_rules) > 0:
+                    self.remove_firewall(dst_ip, uid, wait)
+                    AddFirewallRules.add_iptables_rules(wait, dst_ip, uid)
+            except CommandError as e:
+                if e.returncode == 2:
+                    self.remove_firewall(dst_ip, uid, wait)
+                    msg = "please upgrade iptables to a version that supports the -C option"
+                    logger.warn(msg)
+                    raise
+            except Exception as error:
+                logger.warn(ustr(error))
+                raise
 
-            rc, output = shellutil.run_get_output(FIREWALL_LIST.format(wait))
-            if rc == 0:
-                logger.info("Firewall rules:\n{0}".format(output))
-            else:
-                logger.warn("Listing firewall rules failed: {0}".format(output))
-
-            return True
+            return True, missing_rules
 
         except Exception as e:
             _enable_firewall = False
             logger.info("Unable to establish firewall -- "
                         "no further attempts will be made: "
                         "{0}".format(ustr(e)))
-            return False
+            return False, missing_rules
+
+    def get_firewall_list(self, wait=None):
+        try:
+            if wait is None:
+                wait = self.get_firewall_will_wait()
+            output = shellutil.run_command(get_firewall_list_command(wait))
+            return output
+        except Exception as e:
+            logger.warn("Listing firewall rules failed: {0}".format(ustr(e)))
+            return ""
 
     @staticmethod
-    def _correct_instance_id(id):
-        '''
+    def _correct_instance_id(instance_id):
+        """
         Azure stores the instance ID with an incorrect byte ordering for the
         first parts. For example, the ID returned by the metadata service:
 
@@ -278,107 +341,49 @@ class DefaultOSUtil(object):
 
         This code corrects the byte order such that it is consistent with
         that returned by the metadata service.
-        '''
+        """
 
-        if not UUID_PATTERN.match(id):
-            return id
+        if not UUID_PATTERN.match(instance_id):
+            return instance_id
 
-        parts = id.split('-')
+        parts = instance_id.split('-')
         return '-'.join([
-                textutil.swap_hexstring(parts[0], width=2),
-                textutil.swap_hexstring(parts[1], width=2),
-                textutil.swap_hexstring(parts[2], width=2),
-                parts[3],
-                parts[4]
-            ])
+            textutil.swap_hexstring(parts[0], width=2),
+            textutil.swap_hexstring(parts[1], width=2),
+            textutil.swap_hexstring(parts[2], width=2),
+            parts[3],
+            parts[4]
+        ])
 
     def is_current_instance_id(self, id_that):
-        '''
+        """
         Compare two instance IDs for equality, but allow that some IDs
         may have been persisted using the incorrect byte ordering.
-        '''
+        """
         id_this = self.get_instance_id()
         logger.verbose("current instance id: {0}".format(id_this))
         logger.verbose(" former instance id: {0}".format(id_that))
         return id_this.lower() == id_that.lower() or \
-            id_this.lower() == self._correct_instance_id(id_that).lower()
-
-    @staticmethod
-    def is_cgroups_supported():
-        """
-        Enabled by default; disabled if the base path of cgroups doesn't exist.
-        """
-        return os.path.exists(BASE_CGROUPS)
-
-    @staticmethod
-    def _cgroup_path(tail=""):
-        return os.path.join(BASE_CGROUPS, tail).rstrip(os.path.sep)
-
-    def mount_cgroups(self):
-        try:
-            path = self._cgroup_path()
-            if not os.path.exists(path):
-                fileutil.mkdir(path)
-                self.mount(device='cgroup_root',
-                           mount_point=path,
-                           option="-t tmpfs",
-                           chk_err=False)
-            elif not os.path.isdir(self._cgroup_path()):
-                logger.error("Could not mount cgroups: ordinary file at {0}", path)
-                return
-
-            controllers_to_mount = ['cpu,cpuacct', 'memory']
-            errors = 0
-            cpu_mounted = False
-            for controller in controllers_to_mount:
-                try:
-                    target_path = self._cgroup_path(controller)
-                    if not os.path.exists(target_path):
-                        fileutil.mkdir(target_path)
-                        self.mount(device=controller,
-                                   mount_point=target_path,
-                                   option="-t cgroup -o {0}".format(controller),
-                                   chk_err=False)
-                        if controller == 'cpu,cpuacct':
-                            cpu_mounted = True
-                except Exception as exception:
-                    errors += 1
-                    if errors == len(controllers_to_mount):
-                        raise
-                    logger.warn("Could not mount cgroup controller {0}: {1}", controller, ustr(exception))
-
-            if cpu_mounted:
-                for controller in ['cpu', 'cpuacct']:
-                    target_path = self._cgroup_path(controller)
-                    if not os.path.exists(target_path):
-                        os.symlink(self._cgroup_path('cpu,cpuacct'), target_path)
-
-        except OSError as oe:
-            # log a warning for read-only file systems
-            logger.warn("Could not mount cgroups: {0}", ustr(oe))
-            raise
-        except Exception as e:
-            logger.error("Could not mount cgroups: {0}", ustr(e))
-            raise
+               id_this.lower() == self._correct_instance_id(id_that).lower()
 
     def get_agent_conf_file_path(self):
         return self.agent_conf_file_path
 
     def get_instance_id(self):
-        '''
+        """
         Azure records a UUID as the instance ID
         First check /sys/class/dmi/id/product_uuid.
         If that is missing, then extracts from dmidecode
         If nothing works (for old VMs), return the empty string
-        '''
+        """
         if os.path.isfile(PRODUCT_ID_FILE):
             s = fileutil.read_file(PRODUCT_ID_FILE).strip()
-            
+
         else:
             rc, s = shellutil.run_get_output(DMIDECODE_CMD)
             if rc != 0 or UUID_PATTERN.match(s) is None:
                 return ""
-              
+
         return self._correct_instance_id(s.strip())
 
     @staticmethod
@@ -387,6 +392,9 @@ class DefaultOSUtil(object):
             return pwd.getpwnam(username)
         except KeyError:
             return None
+
+    def get_root_username(self):
+        return "root"
 
     def is_sys_user(self, username):
         """
@@ -404,7 +412,7 @@ class DefaultOSUtil(object):
                                                         "/etc/login.defs")
             if uidmin_def is not None:
                 uidmin = int(uidmin_def.split()[1])
-        except IOError as e:
+        except IOError as e:  # pylint: disable=W0612
             pass
         if uidmin == None:
             uidmin = 100
@@ -423,29 +431,34 @@ class DefaultOSUtil(object):
             return
 
         if expiration is not None:
-            cmd = "useradd -m {0} -e {1}".format(username, expiration)
+            cmd = ["useradd", "-m", username, "-e", expiration]
         else:
-            cmd = "useradd -m {0}".format(username)
-        
+            cmd = ["useradd", "-m", username]
+
         if comment is not None:
-            cmd += " -c {0}".format(comment)
-        retcode, out = shellutil.run_get_output(cmd)
-        if retcode != 0:
-            raise OSUtilError(("Failed to create user account:{0}, "
-                               "retcode:{1}, "
-                               "output:{2}").format(username, retcode, out))
+            cmd.extend(["-c", comment])
+
+        self._run_command_raising_OSUtilError(cmd, err_msg="Failed to create user account:{0}".format(username))
 
     def chpasswd(self, username, password, crypt_id=6, salt_len=10):
         if self.is_sys_user(username):
             raise OSUtilError(("User {0} is a system user, "
                                "will not set password.").format(username))
-        passwd_hash = textutil.gen_password_hash(password, crypt_id, salt_len)
-        cmd = "usermod -p '{0}' {1}".format(passwd_hash, username)
-        ret, output = shellutil.run_get_output(cmd, log_cmd=False)
-        if ret != 0:
-            raise OSUtilError(("Failed to set password for {0}: {1}"
-                               "").format(username, output))
-    
+        passwd_hash = DefaultOSUtil.gen_password_hash(password, crypt_id, salt_len)
+
+        self._run_command_raising_OSUtilError(["usermod", "-p", passwd_hash, username],
+                                              err_msg="Failed to set password for {0}".format(username))
+
+    @staticmethod
+    def gen_password_hash(password, crypt_id, salt_len):
+        collection = string.ascii_letters + string.digits
+        salt = ''.join(random.choice(collection) for _ in range(salt_len))
+        salt = "${0}${1}".format(crypt_id, salt)
+        if sys.version_info[0] == 2:
+            # if python 2.*, encode to type 'str' to prevent Unicode Encode Error from crypt.crypt
+            password = password.encode('utf-8')
+        return crypt(password, salt)
+
     def get_users(self):
         return getpwall()
 
@@ -585,7 +598,7 @@ class DefaultOSUtil(object):
         else:
             return False
 
-    def set_selinux_context(self, path, con):
+    def set_selinux_context(self, path, con):  # pylint: disable=R1710
         """
         Calls shell 'chcon' with 'path' and 'con' context.
         Returns exit result.
@@ -594,7 +607,12 @@ class DefaultOSUtil(object):
             if not os.path.exists(path):
                 logger.error("Path does not exist: {0}".format(path))
                 return 1
-            return shellutil.run('chcon ' + con + ' ' + path)
+            
+            try:
+                shellutil.run_command(['chcon', con, path], log_error=True)
+            except shellutil.CommandError as cmd_err:
+                return cmd_err.returncode
+            return 0
 
     def conf_sshd(self, disable_password):
         option = "no" if disable_password else "yes"
@@ -609,7 +627,7 @@ class DefaultOSUtil(object):
         logger.info("Configured SSH client probing to keep connections alive.")
 
     def get_dvd_device(self, dev_dir='/dev'):
-        pattern = r'(sr[0-9]|hd[c-z]|cdrom[0-9]|cd[0-9])'
+        pattern = r'(sr[0-9]|hd[c-z]|cdrom[0-9]|cd[0-9]|vd[b-z])'
         device_list = os.listdir(dev_dir)
         for dvd in [re.match(pattern, dev) for dev in device_list]:
             if dvd is not None:
@@ -644,7 +662,7 @@ class DefaultOSUtil(object):
         for retry in range(1, max_retry):
             return_code, err = self.mount(dvd_device,
                                           mount_point,
-                                          option="-o ro -t udf,iso9660",
+                                          option=["-o", "ro", "-t", "udf,iso9660,vfat"],
                                           chk_err=False)
             if return_code == 0:
                 logger.info("Successfully mounted dvd")
@@ -665,14 +683,25 @@ class DefaultOSUtil(object):
             mount_point = conf.get_dvd_mount_point()
         return_code = self.umount(mount_point, chk_err=chk_err)
         if chk_err and return_code != 0:
-            raise OSUtilError("Failed to unmount dvd device at {0}",
-                              mount_point)
+            raise OSUtilError("Failed to unmount dvd device at {0}".format(mount_point))
 
     def eject_dvd(self, chk_err=True):
         dvd = self.get_dvd_device()
-        retcode = shellutil.run("eject {0}".format(dvd))
-        if chk_err and retcode != 0:
-            raise OSUtilError("Failed to eject dvd: ret={0}".format(retcode))
+        dev = dvd.rsplit('/', 1)[1]
+        pattern = r'(vd[b-z])'
+        # We should not eject if the disk is not a cdrom
+        if re.search(pattern, dev):
+            return
+
+        try:
+            shellutil.run_command(["eject", dvd])
+        except shellutil.CommandError as cmd_err:
+            if chk_err:
+                
+                msg = "Failed to eject dvd: ret={0}\n[stdout]\n{1}\n\n[stderr]\n{2}"\
+                    .format(cmd_err.returncode, cmd_err.stdout, cmd_err.stderr)
+
+                raise OSUtilError(msg)
 
     def try_load_atapiix_mod(self):
         try:
@@ -692,7 +721,7 @@ class DefaultOSUtil(object):
         if not os.path.isfile(mod_path):
             raise Exception("Can't find module file:{0}".format(mod_path))
 
-        ret, output = shellutil.run_get_output("insmod " + mod_path)
+        ret, output = shellutil.run_get_output("insmod " + mod_path)  # pylint: disable=W0612
         if ret != 0:
             raise Exception("Error calling insmod for ATAPI CD-ROM driver")
         if not self.is_atapiix_mod_loaded(max_retry=3):
@@ -708,16 +737,28 @@ class DefaultOSUtil(object):
                 time.sleep(1)
         return False
 
-    def mount(self, device, mount_point, option="", chk_err=True):
-        cmd = "mount {0} {1} {2}".format(option, device, mount_point)
-        retcode, err = shellutil.run_get_output(cmd, chk_err)
-        if retcode != 0:
-            detail = "[{0}] returned {1}: {2}".format(cmd, retcode, err)
-            err = detail
-        return retcode, err
+    def mount(self, device, mount_point, option=None, chk_err=True):
+        if not option:
+            option = []
+            
+        cmd = ["mount"]
+        cmd.extend(option + [device, mount_point])
+        
+        try:
+            output = shellutil.run_command(cmd, log_error=chk_err)
+        except shellutil.CommandError as cmd_err:
+            detail = "[{0}] returned {1}:\n stdout: {2}\n\nstderr: {3}".format(cmd, cmd_err.returncode,
+                cmd_err.stdout, cmd_err.stderr)
+            return cmd_err.returncode, detail
+
+        return 0, output
 
     def umount(self, mount_point, chk_err=True):
-        return shellutil.run("umount {0}".format(mount_point), chk_err=chk_err)
+        try:
+            shellutil.run_command(["umount", mount_point], log_error=chk_err)
+        except shellutil.CommandError as cmd_err:
+            return cmd_err.returncode
+        return 0
 
     def allow_dhcp_broadcast(self):
         # Open DHCP port if iptables is enabled.
@@ -727,7 +768,9 @@ class DefaultOSUtil(object):
         shellutil.run("iptables -I INPUT -p udp --dport 68 -j ACCEPT",
                       chk_err=False)
 
-    def remove_rules_files(self, rules_files=__RULES_FILES__):
+    def remove_rules_files(self, rules_files=None):
+        if rules_files is None:
+            rules_files = __RULES_FILES__
         lib_dir = conf.get_lib_dir()
         for src in rules_files:
             file_name = fileutil.base_name(src)
@@ -738,7 +781,9 @@ class DefaultOSUtil(object):
                 logger.warn("Move rules file {0} to {1}", file_name, dest)
                 shutil.move(src, dest)
 
-    def restore_rules_files(self, rules_files=__RULES_FILES__):
+    def restore_rules_files(self, rules_files=None):
+        if rules_files is None:
+            rules_files = __RULES_FILES__
         lib_dir = conf.get_lib_dir()
         for dest in rules_files:
             filename = fileutil.base_name(dest)
@@ -765,7 +810,7 @@ class DefaultOSUtil(object):
         sock = socket.socket(socket.AF_INET,
                              socket.SOCK_DGRAM,
                              socket.IPPROTO_UDP)
-        param = struct.pack('256s', (ifname[:15]+('\0'*241)).encode('latin-1'))
+        param = struct.pack('256s', (ifname[:15] + ('\0' * 241)).encode('latin-1'))
         info = fcntl.ioctl(sock.fileno(), IOCTL_SIOCGIFHWADDR, param)
         sock.close()
         return ''.join(['%02X' % textutil.str_to_ord(char) for char in info[18:24]])
@@ -785,7 +830,7 @@ class DefaultOSUtil(object):
         Return a dictionary mapping from interface name to IPv4 address.
         Interfaces without a name are ignored.
         """
-        expected=16 # how many devices should I expect...
+        expected = 16  # how many devices should I expect...
         struct_size = DefaultOSUtil._get_struct_ifconf_size()
         array_size = expected * struct_size
 
@@ -801,15 +846,14 @@ class DefaultOSUtil(object):
             logger.warn(('SIOCGIFCONF returned more than {0} up '
                          'network interfaces.'), expected)
 
-        ifconf_buff = buff.tostring()
-
+        ifconf_buff = array_to_bytes(buff)
         ifaces = {}
         for i in range(0, array_size, struct_size):
-            iface = ifconf_buff[i:i+IFNAMSIZ].split(b'\0', 1)[0]
+            iface = ifconf_buff[i:i + IFNAMSIZ].split(b'\0', 1)[0]
             if len(iface) > 0:
                 iface_name = iface.decode('latin-1')
                 if iface_name not in ifaces:
-                    ifaces[iface_name] = socket.inet_ntoa(ifconf_buff[i+20:i+24])
+                    ifaces[iface_name] = socket.inet_ntoa(ifconf_buff[i + 20:i + 24])
         return ifaces
 
     def get_first_if(self):
@@ -861,7 +905,7 @@ class DefaultOSUtil(object):
             route = entry.split("\t")
             if len(route) > 0:
                 route_obj = RouteEntry(route[idx_iface], route[idx_dest], route[idx_gw], route[idx_mask],
-                                                   route[idx_flags], route[idx_metric])
+                                       route[idx_flags], route[idx_metric])
                 route_list.append(route_obj)
         return route_list
 
@@ -928,6 +972,7 @@ class DefaultOSUtil(object):
         if len(candidates) > 0:
             def get_metric(route):
                 return int(route.metric)
+
             primary_route = min(candidates, key=get_metric)
             primary_interface = primary_route.interface
 
@@ -959,7 +1004,7 @@ class DefaultOSUtil(object):
         Determine if a named interface is loopback.
         """
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        ifname_buff = ifname + ('\0'*256)
+        ifname_buff = ifname + ('\0' * 256)
         result = fcntl.ioctl(s.fileno(), IOCTL_SIOCGIFFLAGS, ifname_buff)
         flags, = struct.unpack('H', result[16:18])
         isloopback = flags & 8 == 8
@@ -993,7 +1038,8 @@ class DefaultOSUtil(object):
         HEADER_EXPIRE = "expire"
         FOOTER_LEASE = "}"
         FORMAT_DATETIME = "%Y/%m/%d %H:%M:%S"
-        option_245_re = re.compile(r'\s*option\s+unknown-245\s+([0-9a-fA-F]+):([0-9a-fA-F]+):([0-9a-fA-F]+):([0-9a-fA-F]+);')
+        option_245_re = re.compile(
+            r'\s*option\s+unknown-245\s+([0-9a-fA-F]+):([0-9a-fA-F]+):([0-9a-fA-F]+):([0-9a-fA-F]+);')
 
         logger.info("looking for leases in path [{0}]".format(pathglob))
         for lease_file in glob.glob(pathglob):
@@ -1015,7 +1061,7 @@ class DefaultOSUtil(object):
                                 expire_date = datetime.datetime.strptime(expire_string, FORMAT_DATETIME)
                                 if expire_date > datetime.datetime.utcnow():
                                     expired = False
-                            except:
+                            except:  # pylint: disable=W0702
                                 logger.error("could not parse expiry token '{0}'".format(line))
                     elif FOOTER_LEASE in line:
                         logger.info("dhcp entry:{0}, 245:{1}, expired:{2}".format(
@@ -1040,12 +1086,16 @@ class DefaultOSUtil(object):
         return endpoint
 
     def is_missing_default_route(self):
-        route_cmd = "ip route show"
-        routes = shellutil.run_get_output(route_cmd)[1]
-        for route in routes.split("\n"):
-            if route.startswith("0.0.0.0 ") or route.startswith("default "):
-               return False
-        return True
+        try:
+            route_cmd = ["ip", "route", "show"]
+            routes = shellutil.run_command(route_cmd)
+            for route in routes.split("\n"):
+                if route.startswith("0.0.0.0 ") or route.startswith("default "):
+                    return False
+            return True
+        except CommandError as e:
+            logger.warn("Cannot get the routing table. {0} failed: {1}", ustr(route_cmd), ustr(e))
+            return False
 
     def get_if_name(self):
         if_name = ''
@@ -1061,15 +1111,18 @@ class DefaultOSUtil(object):
         return self.get_first_if()[1]
 
     def set_route_for_dhcp_broadcast(self, ifname):
-        route_cmd = "ip route add"
-        return shellutil.run("{0} 255.255.255.255 dev {1}".format(
-            route_cmd, ifname),
-                             chk_err=False)
+        try:
+            route_cmd = ["ip", "route", "add", "255.255.255.255", "dev", ifname]
+            return shellutil.run_command(route_cmd)
+        except CommandError:
+            return ""
 
     def remove_route_for_dhcp_broadcast(self, ifname):
-        route_cmd = "ip route del"
-        shellutil.run("{0} 255.255.255.255 dev {1}".format(route_cmd, ifname),
-                      chk_err=False)
+        try:
+            route_cmd = ["ip", "route", "del", "255.255.255.255", "dev", ifname]
+            shellutil.run_command(route_cmd)
+        except CommandError:
+            pass
 
     def is_dhcp_available(self):
         return True
@@ -1101,22 +1154,28 @@ class DefaultOSUtil(object):
     def restart_ssh_service(self):
         pass
 
-    def route_add(self, net, mask, gateway):
+    def route_add(self, net, mask, gateway):  # pylint: disable=W0613
         """
         Add specified route 
         """
-        cmd = "ip route add {0} via {1}".format(net, gateway)
-        return shellutil.run(cmd, chk_err=False)
+        try:
+            cmd = ["ip", "route", "add", str(net), "via", gateway]
+            return shellutil.run_command(cmd)
+        except CommandError:
+            return ""
 
     @staticmethod
     def _text_to_pid_list(text):
         return [int(n) for n in text.split()]
 
     @staticmethod
-    def _get_dhcp_pid(command):
+    def _get_dhcp_pid(command, transform_command_output=None):
         try:
-            return DefaultOSUtil._text_to_pid_list(shellutil.run_command(command))
-        except CommandError as exception:
+            output = shellutil.run_command(command)
+            if transform_command_output is not None:
+                output = transform_command_output(output)
+            return DefaultOSUtil._text_to_pid_list(output)
+        except CommandError as exception:  # pylint: disable=W0612
             return []
 
     def get_dhcp_pid(self):
@@ -1124,7 +1183,7 @@ class DefaultOSUtil(object):
 
     def set_hostname(self, hostname):
         fileutil.write_file('/etc/hostname', hostname)
-        shellutil.run("hostname {0}".format(hostname), chk_err=False)
+        self._run_command_without_raising(["hostname", hostname], log_error=False)
 
     def set_dhcp_hostname(self, hostname):
         autosend = r'^[^#]*?send\s*host-name.*?(<hostname>|gethostname[(,)])'
@@ -1133,16 +1192,16 @@ class DefaultOSUtil(object):
             if not os.path.isfile(conf_file):
                 continue
             if fileutil.findre_in_file(conf_file, autosend):
-                #Return if auto send host-name is configured
+                # Return if auto send host-name is configured
                 return
             fileutil.update_conf_file(conf_file,
                                       'send host-name',
                                       'send host-name "{0}";'.format(hostname))
 
     def restart_if(self, ifname, retries=3, wait=5):
-        retry_limit=retries+1
+        retry_limit = retries + 1
         for attempt in range(1, retry_limit):
-            return_code=shellutil.run("ifdown {0} && ifup {0}".format(ifname), expected_errors=[1] if attempt < retries else [])
+            return_code = shellutil.run("ifdown {0} && ifup {0}".format(ifname), expected_errors=[1] if attempt < retries else [])
             if return_code == 0:
                 return
             logger.warn("failed to restart {0}: return code {1}".format(ifname, return_code))
@@ -1152,11 +1211,20 @@ class DefaultOSUtil(object):
             else:
                 logger.warn("exceeded restart retries")
 
-    def publish_hostname(self, hostname):
+    def check_and_recover_nic_state(self, ifname):
+        # TODO: This should be implemented for all distros where we reset the network during publishing hostname. Currently it is only implemented in RedhatOSUtil.
+        pass
+
+    def publish_hostname(self, hostname, recover_nic=False):
+        """
+        Publishes the provided hostname.
+        """
         self.set_dhcp_hostname(hostname)
         self.set_hostname_record(hostname)
         ifname = self.get_if_name()
         self.restart_if(ifname)
+        if recover_nic:
+            self.check_and_recover_nic_state(ifname)
 
     def set_scsi_disks_timeout(self, timeout):
         for dev in os.listdir("/sys/block"):
@@ -1187,9 +1255,9 @@ class DefaultOSUtil(object):
         """
         if (mountlist and device):
             for entry in mountlist.split('\n'):
-                if(re.search(device, entry)):
+                if (re.search(device, entry)):
                     tokens = entry.split()
-                    #Return the 3rd column of this line
+                    # Return the 3rd column of this line
                     return tokens[2] if len(tokens) > 2 else None
         return None
 
@@ -1230,7 +1298,7 @@ class DefaultOSUtil(object):
         try:
             for vmbus, guid in DefaultOSUtil._enumerate_device_id():
                 if guid.startswith(gen1_device_prefix) or guid == gen2_device_id:
-                    for root, dirs, files in os.walk(STORAGE_DEVICE_PATH + vmbus):
+                    for root, dirs, files in os.walk(STORAGE_DEVICE_PATH + vmbus):  # pylint: disable=W0612
                         root_path_parts = root.split('/')
                         # For Gen1 VMs we only have to check for the block dir in the
                         # current device. But for Gen2 VMs all of the disks (sda, sdb,
@@ -1279,21 +1347,50 @@ class DefaultOSUtil(object):
     def get_hostname_record(self):
         hostname_record = conf.get_published_hostname()
         if not os.path.exists(hostname_record):
-            # this file is created at provisioning time with agents >= 2.2.3
-            hostname = socket.gethostname()
-            logger.info('Hostname record does not exist, '
-                        'creating [{0}] with hostname [{1}]',
-                        hostname_record,
-                        hostname)
+            # older agents (but newer or equal to 2.2.3) create published_hostname during provisioning; when provisioning is done
+            # by cloud-init the hostname is written to set-hostname
+            hostname = self._get_cloud_init_hostname()
+            if hostname is None:
+                logger.info("Retrieving hostname using socket.gethostname()")
+                hostname = socket.gethostname()
+            logger.info('Published hostname record does not exist, creating [{0}] with hostname [{1}]', hostname_record, hostname)
             self.set_hostname_record(hostname)
         record = fileutil.read_file(hostname_record)
         return record
 
+    @staticmethod
+    def _get_cloud_init_hostname():
+        """
+        Retrieves the hostname set by cloud-init; returns None if cloud-init did not set the hostname or if there is an
+        error retrieving it.
+        """
+        hostname_file = '/var/lib/cloud/data/set-hostname'
+        try:
+            if os.path.exists(hostname_file):
+                #
+                # The format is similar to
+                #
+                #     $ cat /var/lib/cloud/data/set-hostname
+                #     {
+                #      "fqdn": "nam-u18",
+                #      "hostname": "nam-u18"
+                #     }
+                #
+                logger.info("Retrieving hostname from {0}", hostname_file)
+                with open(hostname_file, 'r') as file_:
+                    hostname_info = json.load(file_)
+                if "hostname" in hostname_info:
+                    return hostname_info["hostname"]
+        except Exception as exception:
+            logger.warn("Error retrieving hostname: {0}", ustr(exception))
+        return None
+
     def del_account(self, username):
         if self.is_sys_user(username):
             logger.error("{0} is a system user. Will not delete it.", username)
-        shellutil.run("> /var/run/utmp")
-        shellutil.run("userdel -f -r " + username)
+
+        self._run_command_without_raising(["touch", "/var/run/utmp"])
+        self._run_command_without_raising(['userdel', '-f', '-r', username])
         self.conf_sudoer(username, remove=True)
 
     def decode_customdata(self, data):
@@ -1301,7 +1398,7 @@ class DefaultOSUtil(object):
 
     def get_total_mem(self):
         # Get total memory in bytes and divide by 1024**2 to get the value in MB.
-        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / (1024**2)
+        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / (1024 ** 2)
 
     def get_processor_cores(self):
         return multiprocessing.cpu_count()
@@ -1312,15 +1409,15 @@ class DefaultOSUtil(object):
             os.kill(pid, 0)
         except (ValueError, TypeError):
             return False
-        except OSError as e:
-            if e.errno == errno.EPERM:
+        except OSError as os_error:
+            if os_error.errno == errno.EPERM:
                 return True
             return False
         return True
 
     @property
     def is_64bit(self):
-        return sys.maxsize > 2**32
+        return sys.maxsize > 2 ** 32
 
     @staticmethod
     def _get_proc_stat():
@@ -1354,52 +1451,83 @@ class DefaultOSUtil(object):
         if proc_stat is not None:
             for line in proc_stat.splitlines():
                 if ALL_CPUS_REGEX.match(line):
-                    system_cpu = sum(int(i) for i in line.split()[1:8])  # see "man proc" for a description of these fields
+                    system_cpu = sum(
+                        int(i) for i in line.split()[1:8])  # see "man proc" for a description of these fields
                     break
         return system_cpu
 
-    def get_nic_state(self):
+    @staticmethod
+    def get_used_and_available_system_memory():
+        """
+        Get the contents of free -b in bytes.
+        # free -b
+        #              total        used        free      shared  buff/cache   available
+        # Mem:     8340144128   619352064  5236809728     1499136  2483982336  7426314240
+        # Swap:             0           0           0
+
+        :return: used and available memory in megabytes
+        """
+        used_mem = available_mem = 0
+        free_cmd = ["free", "-b"]
+        memory = shellutil.run_command(free_cmd)
+        for line in memory.split("\n"):
+            if ALL_MEMS_REGEX.match(line):
+                mems = line.split()
+                used_mem = int(mems[2])
+                available_mem = int(mems[6])  # see "man free" for a description of these fields
+        return used_mem/(1024 ** 2), available_mem/(1024 ** 2)
+
+    def get_nic_state(self, as_string=False):
         """
         Capture NIC state (IPv4 and IPv6 addresses plus link state).
 
-        :return: Dictionary of NIC state objects, with the NIC name as key
+        :return: By default returns a dictionary of NIC state objects, with the NIC name as key. If as_string is True
+                 returns the state as a string
         :rtype: dict(str,NetworkInformationCard)
         """
         state = {}
 
-        status, output = shellutil.run_get_output("ip -a -o link", chk_err=False, log_cmd=False)
-        """
-        1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00 promiscuity 0 addrgenmode eui64
-        2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000\    link/ether 00:0d:3a:30:c3:5a brd ff:ff:ff:ff:ff:ff promiscuity 0 addrgenmode eui64
-        3: docker0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN mode DEFAULT group default \    link/ether 02:42:b5:d5:00:1d brd ff:ff:ff:ff:ff:ff promiscuity 0 \    bridge forward_delay 1500 hello_time 200 max_age 2000 ageing_time 30000 stp_state 0 priority 32768 vlan_filtering 0 vlan_protocol 802.1Q addrgenmode eui64
+        all_command = ["ip", "-a", "-o", "link"]
+        inet_command = ["ip", "-4", "-a", "-o", "address"]
+        inet6_command = ["ip", "-6", "-a", "-o", "address"]
 
-        """
-        if status != 0:
-            logger.verbose("Could not fetch NIC link info; status {0}, {1}".format(status, output))
-            return {}
+        try:
+            all_output = shellutil.run_command(all_command)
+        except shellutil.CommandError as command_error:
+            logger.verbose("Could not fetch NIC link info: {0}", ustr(command_error))
+            return "" if as_string else {}
 
-        for entry in output.splitlines():
+        if as_string:
+            def run_command(command):
+                try:
+                    return shellutil.run_command(command)
+                except shellutil.CommandError as command_error:
+                    return str(command_error)
+
+            inet_output = run_command(inet_command)
+            inet6_output = run_command(inet6_command)
+
+            return "Executing {0}:\n{1}\nExecuting {2}:\n{3}\nExecuting {4}:\n{5}\n".format(all_command, all_output, inet_command, inet_output, inet6_command, inet6_output)
+        else:
+            self._update_nic_state_all(state, all_output)
+            self._update_nic_state(state, inet_command, NetworkInterfaceCard.add_ipv4, "an IPv4 address")
+            self._update_nic_state(state, inet6_command, NetworkInterfaceCard.add_ipv6, "an IPv6 address")
+            return state
+
+    @staticmethod
+    def _update_nic_state_all(state, command_output):
+        for entry in command_output.splitlines():
+            # Sample output:
+            #     1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00 promiscuity 0 addrgenmode eui64
+            #     2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000\    link/ether 00:0d:3a:30:c3:5a brd ff:ff:ff:ff:ff:ff promiscuity 0 addrgenmode eui64
+            #     3: docker0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN mode DEFAULT group default \    link/ether 02:42:b5:d5:00:1d brd ff:ff:ff:ff:ff:ff promiscuity 0 \    bridge forward_delay 1500 hello_time 200 max_age 2000 ageing_time 30000 stp_state 0 priority 32768 vlan_filtering 0 vlan_protocol 802.1Q addrgenmode eui64
             result = IP_COMMAND_OUTPUT.match(entry)
             if result:
                 name = result.group(1)
                 state[name] = NetworkInterfaceCard(name, result.group(2))
 
-        self._update_nic_state(state, "ip -4 -a -o address", NetworkInterfaceCard.add_ipv4, "an IPv4 address")
-        """
-        1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
-        2: eth0    inet 10.145.187.220/26 brd 10.145.187.255 scope global eth0\       valid_lft forever preferred_lft forever
-        3: docker0    inet 192.168.43.1/24 brd 192.168.43.255 scope global docker0\       valid_lft forever preferred_lft forever
-        """
-
-        self._update_nic_state(state, "ip -6 -a -o address", NetworkInterfaceCard.add_ipv6, "an IPv6 address")
-        """
-        1: lo    inet6 ::1/128 scope host \       valid_lft forever preferred_lft forever
-        2: eth0    inet6 fe80::20d:3aff:fe30:c35a/64 scope link \       valid_lft forever preferred_lft forever
-        """
-
-        return state
-
-    def _update_nic_state(self, state, ip_command, handler, description):
+    @staticmethod
+    def _update_nic_state(state, ip_command, handler, description):
         """
         Update the state of NICs based on the output of a specified ip subcommand.
 
@@ -1408,15 +1536,54 @@ class DefaultOSUtil(object):
         :param handler: A method on the NetworkInterfaceCard class
         :param str description: Description of the particular information being added to the state
         """
-        status, output = shellutil.run_get_output(ip_command, chk_err=True)
-        if status != 0:
-            return
+        try:
+            output = shellutil.run_command(ip_command)
 
-        for entry in output.splitlines():
-            result = IP_COMMAND_OUTPUT.match(entry)
-            if result:
-                interface_name = result.group(1)
-                if interface_name in state:
-                    handler(state[interface_name], result.group(2))
-                else:
-                    logger.error("Interface {0} has {1} but no link state".format(interface_name, description))
+            for entry in output.splitlines():
+                # family inet sample output:
+                #     1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+                #     2: eth0    inet 10.145.187.220/26 brd 10.145.187.255 scope global eth0\       valid_lft forever preferred_lft forever
+                #     3: docker0    inet 192.168.43.1/24 brd 192.168.43.255 scope global docker0\       valid_lft forever preferred_lft forever
+                #
+                # family inet6 sample output:
+                #     1: lo    inet6 ::1/128 scope host \       valid_lft forever preferred_lft forever
+                #     2: eth0    inet6 fe80::20d:3aff:fe30:c35a/64 scope link \       valid_lft forever preferred_lft forever
+                result = IP_COMMAND_OUTPUT.match(entry)
+                if result:
+                    interface_name = result.group(1)
+                    if interface_name in state:
+                        handler(state[interface_name], result.group(2))
+                    else:
+                        logger.error("Interface {0} has {1} but no link state".format(interface_name, description))
+        except shellutil.CommandError as command_error:
+            logger.error("[{0}] failed: {1}", ' '.join(ip_command), str(command_error))
+
+    @staticmethod
+    def _run_command_without_raising(cmd, log_error=True):
+        try:
+            shellutil.run_command(cmd, log_error=log_error)
+        # Original implementation of run() does a blanket catch, so mimicking the behaviour here
+        except Exception:
+            pass
+
+    @staticmethod
+    def _run_multiple_commands_without_raising(commands, log_error=True, continue_on_error=False):
+        for cmd in commands:
+            try:
+                shellutil.run_command(cmd, log_error=log_error)
+            # Original implementation of run() does a blanket catch, so mimicking the behaviour here
+            except Exception:
+                if continue_on_error:
+                    continue
+                break
+
+    @staticmethod
+    def _run_command_raising_OSUtilError(cmd, err_msg, cmd_input=None):
+        # This method runs shell command using the new secure shellutil.run_command and raises OSUtilErrors on failures.
+        try:
+            return shellutil.run_command(cmd, log_error=True, input=cmd_input)
+        except shellutil.CommandError as e:
+            raise OSUtilError(
+                "{0}, Retcode: {1}, Output: {2}, Error: {3}".format(err_msg, e.returncode, e.stdout, e.stderr))
+        except Exception as e:
+            raise OSUtilError("{0}, Retcode: {1}, Error: {2}".format(err_msg, -1, ustr(e)))

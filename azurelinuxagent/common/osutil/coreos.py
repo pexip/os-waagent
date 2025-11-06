@@ -17,7 +17,7 @@
 #
 
 import os
-import azurelinuxagent.common.utils.shellutil as shellutil
+from azurelinuxagent.common.utils import shellutil
 from azurelinuxagent.common.osutil.default import DefaultOSUtil
 
 
@@ -42,6 +42,10 @@ class CoreOSUtil(DefaultOSUtil):
             py_path = self.waagent_path
         os.environ['PYTHONPATH'] = py_path
 
+    @staticmethod
+    def get_agent_bin_path():
+        return "/usr/share/oem/bin"
+
     def is_sys_user(self, username):
         # User 'core' is not a sysuser.
         if username == 'core':
@@ -54,7 +58,7 @@ class CoreOSUtil(DefaultOSUtil):
     def start_network(self):
         return shellutil.run("systemctl start systemd-networkd", chk_err=False)
 
-    def restart_if(self, *dummy, **_):
+    def restart_if(self, ifname=None, retries=None, wait=None):
         shellutil.run("systemctl restart systemd-networkd")
 
     def restart_ssh_service(self):
@@ -74,7 +78,9 @@ class CoreOSUtil(DefaultOSUtil):
         return shellutil.run("systemctl stop {0}".format(self.service_name), chk_err=False)
 
     def get_dhcp_pid(self):
-        return self._get_dhcp_pid(["systemctl", "show", "-p", "MainPID", "systemd-networkd"])
+        return self._get_dhcp_pid(
+            ["systemctl", "show", "-p", "MainPID", "systemd-networkd"],
+            transform_command_output=lambda o: o.replace("MainPID=", ""))
 
     def conf_sshd(self, disable_password):
         # In CoreOS, /etc/sshd_config is mount readonly.  Skip the setting.

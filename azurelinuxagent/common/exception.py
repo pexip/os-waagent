@@ -22,6 +22,21 @@ Defines all exceptions
 """
 
 
+class ExitException(BaseException):
+    """
+    Used to exit the agent's process
+    """
+    def __init__(self, reason):
+        super(ExitException, self).__init__()
+        self.reason = reason
+
+
+class AgentUpgradeExitException(ExitException):
+    """
+    Used to exit the agent's process due to Agent Upgrade
+    """
+
+
 class AgentError(Exception):
     """
     Base class of agent error.
@@ -43,6 +58,14 @@ class AgentConfigError(AgentError):
         super(AgentConfigError, self).__init__(msg, inner)
 
 
+class AgentMemoryExceededException(AgentError):
+    """
+    When Agent memory limit reached.
+    """
+    def __init__(self, msg=None, inner=None):
+        super(AgentMemoryExceededException, self).__init__(msg, inner)
+
+
 class AgentNetworkError(AgentError):
     """
     When network is not available.
@@ -50,6 +73,24 @@ class AgentNetworkError(AgentError):
 
     def __init__(self, msg=None, inner=None):
         super(AgentNetworkError, self).__init__(msg, inner)
+
+
+class AgentUpdateError(AgentError):
+    """
+    When agent failed to update.
+    """
+
+    def __init__(self, msg=None, inner=None):
+        super(AgentUpdateError, self).__init__(msg, inner)
+
+
+class AgentFamilyMissingError(AgentError):
+    """
+    When agent family is missing.
+    """
+
+    def __init__(self, msg=None, inner=None):
+        super(AgentFamilyMissingError, self).__init__(msg, inner)
 
 
 class CGroupsException(AgentError):
@@ -84,20 +125,32 @@ class ExtensionOperationError(ExtensionError):
 
 class ExtensionUpdateError(ExtensionError):
     """
-    When failed to update an extension
+    Error raised when failed to update an extension
     """
-
-    def __init__(self, msg=None, inner=None, code=-1):
-        super(ExtensionUpdateError, self).__init__(msg, inner, code)
 
 
 class ExtensionDownloadError(ExtensionError):
     """
-    When failed to download and setup an extension
+    Error raised when failed to download and setup an extension
     """
 
-    def __init__(self, msg=None, inner=None, code=-1):
-        super(ExtensionDownloadError, self).__init__(msg, inner, code)
+
+class ExtensionsGoalStateError(ExtensionError):
+    """
+    Error raised when the ExtensionsGoalState is malformed
+    """
+
+
+class ExtensionsConfigError(ExtensionsGoalStateError):
+    """
+    Error raised when the ExtensionsConfig is malformed
+    """
+
+
+class MultiConfigExtensionEnableError(ExtensionError):
+    """
+    Error raised when enable for a Multi-Config extension is failing.
+    """
 
 
 class ProvisionError(AgentError):
@@ -147,11 +200,8 @@ class ProtocolError(AgentError):
 
 class ProtocolNotFoundError(ProtocolError):
     """
-    Azure protocol endpoint not found
+    Error raised when Azure protocol endpoint not found
     """
-
-    def __init__(self, msg=None, inner=None):
-        super(ProtocolNotFoundError, self).__init__(msg, inner)
 
 
 class HttpError(AgentError):
@@ -165,11 +215,8 @@ class HttpError(AgentError):
 
 class InvalidContainerError(HttpError):
     """
-    Container id sent in the header is invalid
+    Error raised when Container id sent in the header is invalid
     """
-
-    def __init__(self, msg=None, inner=None):
-        super(InvalidContainerError, self).__init__(msg, inner)
 
 
 class EventError(AgentError):
@@ -210,13 +257,26 @@ class ResourceGoneError(HttpError):
         super(ResourceGoneError, self).__init__(msg, inner)
 
 
-class RemoteAccessError(AgentError):
+class InvalidExtensionEventError(AgentError):
     """
-    Remote Access Error
+    Error thrown when the extension telemetry event is invalid as defined per the contract with extensions.
+    """
+    # Types of InvalidExtensionEventError
+    MissingKeyError = "MissingKeyError"
+    EmptyMessageError = "EmptyMessageError"
+    OversizeEventError = "OversizeEventError"
+
+    def __init__(self, msg=None, inner=None):
+        super(InvalidExtensionEventError, self).__init__(msg, inner)
+
+
+class ServiceStoppedError(AgentError):
+    """
+    Error thrown when trying to access a Service which is stopped
     """
 
     def __init__(self, msg=None, inner=None):
-        super(RemoteAccessError, self).__init__(msg, inner)
+        super(ServiceStoppedError, self).__init__(msg, inner)
 
 
 class ExtensionErrorCodes(object):
@@ -269,3 +329,15 @@ class ExtensionErrorCodes(object):
 
     def __init__(self):
         pass
+
+
+class GoalStateAggregateStatusCodes(object):
+
+    # Success
+    Success = 0
+
+    # Unknown failure
+    GoalStateUnknownFailure = -1
+
+    # The goal state requires features that are not supported by this version of the VM agent
+    GoalStateUnsupportedRequiredFeatures = 2001
