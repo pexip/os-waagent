@@ -7,11 +7,11 @@ include /usr/share/dpkg/default.mk
 export PYBUILD_INSTALL_ARGS=--install-scripts /usr/sbin
 
 %:
-	dh $@ --with python3 --buildsystem pybuild
+	dh $@ --buildsystem pybuild
 
 override_dh_auto_install:
 	dh_auto_install
-	rm -rf debian/walinuxagent/usr/lib/python3*/dist-packages/tests/
+	rm -rf debian/waagent/usr/lib/python3*/dist-packages/tests/
 
 override_dh_auto_test:
 	dh_auto_test
@@ -21,11 +21,7 @@ override_dh_auto_clean:
 	rm -rf AzureLinuxAgent.egg-info
 
 override_dh_installinit:
-	dh_installinit -p walinuxagent --name walinuxagent
-
-
-override_dh_python3:
-	dh_python3 -O--buildsystem=pybuild --shebang "/usr/bin/python3"
+	dh_installinit -p waagent --name walinuxagent
 
 override_dh_installsystemd:
 	dh_installsystemd -p waagent --name walinuxagent

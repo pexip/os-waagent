@@ -31,8 +31,6 @@ Pre-Depends:
 Depends:
  ${misc:Depends}, ${python3:Depends},
  ca-certificates,
- host,
- openssh-server,
  openssl,
  python3-crypt-r
 Suggests:
