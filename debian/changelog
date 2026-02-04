@@ -1,3 +1,9 @@
+waagent (2.12.0.2-3+pexip25u3) pexip-trixie; urgency=medium
+
+  * Remove python3-legacycrypt dependency
+
+ -- Mark Hymers <mark.hymers@pexip.com>  Wed, 04 Feb 2026 14:32:52 +0000
+
 waagent (2.12.0.2-3+pexip25u2) pexip-trixie; urgency=medium
 
   * Trixie build for product distribution
