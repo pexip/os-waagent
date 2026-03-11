@@ -1,3 +1,9 @@
+waagent (2.12.0.2-3+pexip25u4) pexip-trixie; urgency=medium
+
+  * d/p/pexos: fix pid file
+
+ -- Huw Jones <huw@pexip.com>  Wed, 11 Mar 2026 11:06:11 +0000
+
 waagent (2.12.0.2-3+pexip25u3) pexip-trixie; urgency=medium
 
   * Remove python3-legacycrypt dependency

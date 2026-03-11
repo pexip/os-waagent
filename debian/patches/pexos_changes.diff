@@ -669,7 +669,7 @@ Add PexOS flavour (forked from Debian)
 +# DVD.MountPoint=/mnt/cdrom/secure
 +
 +#
-+Pid.File=/var/run/walinuxagent/waagent.pid
++Pid.File=/run/waagent/waagent.pid
 +
 +#
 +# Extension.LogDir=/var/log/azure
