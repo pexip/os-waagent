@@ -1,3 +1,4 @@
+Replaced removed stdlib crypt module with crypt-r
 Index: waagent/requirements.txt
 ===================================================================
 --- waagent.orig/requirements.txt

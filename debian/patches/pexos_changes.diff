@@ -1,3 +1,4 @@
+Add PexOS flavour (forked from Debian)
 --- a/azurelinuxagent/agent.py
 +++ b/azurelinuxagent/agent.py
 @@ -196,11 +196,6 @@
