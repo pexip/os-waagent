@@ -80,7 +80,7 @@ Add PexOS flavour (forked from Debian)
      return DefaultOSUtil()
 --- /dev/null
 +++ b/azurelinuxagent/common/osutil/pexos.py
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,278 @@
 +from azurelinuxagent.common.osutil.debian import DebianOSUtil
 +
 +class PexOSUtil:
@@ -142,7 +142,11 @@ Add PexOS flavour (forked from Debian)
 +
 +    def get_instance_id(self):
 +        # azurelinuxagent/pa/provision/default.py
-+        return self._default.get_instance_id()
++        try:
++            with open("/etc/machine-id", "r") as machine_f:
++                return str(uuid.UUID(machine_f.read().strip()))
++        except (OSError, ValueError):
++            return ""
 +
 +    def get_root_username(self):
 +        # azurelinuxagent/agent.py
