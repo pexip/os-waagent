@@ -80,7 +80,9 @@ Add PexOS flavour (forked from Debian)
      return DefaultOSUtil()
 --- /dev/null
 +++ b/azurelinuxagent/common/osutil/pexos.py
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,280 @@
++import uuid
++
 +from azurelinuxagent.common.osutil.debian import DebianOSUtil
 +
 +class PexOSUtil:
@@ -356,9 +358,9 @@ Add PexOS flavour (forked from Debian)
 +        # azurelinuxagent/ga/monitor.py
 +        return DebianOSUtil.get_used_and_available_system_memory()
 +
-+    def get_nic_state(self):
++    def get_nic_state(self, as_string=False):
 +        # azurelinuxagent/ga/monitor.py
-+        return {}
++        return "" if as_string else {}
 --- a/azurelinuxagent/daemon/main.py
 +++ b/azurelinuxagent/daemon/main.py
 @@ -137,10 +137,6 @@
